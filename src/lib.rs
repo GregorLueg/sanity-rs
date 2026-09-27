@@ -38,6 +38,9 @@ pub mod simulate;
 mod model;
 mod utils;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
+
 use rayon::prelude::*;
 
 use crate::config::{SanityParams, VarianceGrid, VarianceRule};
@@ -45,6 +48,7 @@ use crate::errors::SanityErrors;
 use crate::float::{SanityFloat, narrow};
 use crate::input::CountMatrix;
 use crate::model::gene::{GeneScratch, GeneSummary, run_gene};
+use crate::utils::progress::report_decile_progress;
 
 //////////////////
 // SanityOutput //
@@ -128,6 +132,13 @@ pub fn sanity<T: SanityFloat>(
     let n_genes = counts.n_genes();
     let (grid, log_totals, log_total_sum) = prepare_run(counts, cell_totals, &params)?;
 
+    let verbose = params.verbosity.normal_verbosity();
+    if verbose {
+        print_run_header("CPU", n_genes, n_cells, &params);
+    }
+    let start = Instant::now();
+    let done = AtomicUsize::new(0);
+
     let mut log_fold_changes = vec![T::zero(); n_genes * n_cells];
     let mut error_bars = vec![T::zero(); n_genes * n_cells];
     let mut mean_log_quotient = vec![T::zero(); n_genes];
@@ -174,6 +185,10 @@ pub fn sanity<T: SanityFloat>(
                 *out_dm = narrow(summary.mean_log_quotient_error);
                 *out_v = narrow(summary.variance);
 
+                if verbose {
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    report_decile_progress(d, d - 1, n_genes, "genes", start.elapsed());
+                }
                 Ok::<(), SanityErrors>(())
             },
         )?;
@@ -188,6 +203,31 @@ pub fn sanity<T: SanityFloat>(
         n_genes,
         n_cells,
     })
+}
+
+/// Print the one-line summary a verbose run opens with.
+///
+/// ### Params
+///
+/// * `device` - Where the run happens, `"CPU"` or `"GPU"`.
+/// * `n_genes` - Genes in the input.
+/// * `n_cells` - Cells in the input.
+/// * `params` - Resolved run parameters.
+pub(crate) fn print_run_header(
+    device: &str,
+    n_genes: usize,
+    n_cells: usize,
+    params: &SanityParams,
+) {
+    let grid = if params.variance_rule.needs_grid() {
+        format!(", {} variance bins", params.variance_bins)
+    } else {
+        String::new()
+    };
+    println!(
+        "Sanity ({device}): {n_genes} genes x {n_cells} cells, {:?}{grid}",
+        params.variance_rule
+    );
 }
 
 /// Validate the run inputs and derive what every gene shares.
@@ -322,10 +362,18 @@ where
 {
     let params = params.unwrap_or_default();
     let n_cells = counts.n_cells();
+    let n_genes = counts.n_genes();
     let (grid, log_totals, log_total_sum) = prepare_run(counts, cell_totals, &params)?;
 
+    let verbose = params.verbosity.normal_verbosity();
+    if verbose {
+        print_run_header("CPU", n_genes, n_cells, &params);
+    }
+    let start = Instant::now();
+    let done = AtomicUsize::new(0);
+
     let n_bins = grid.len();
-    let kept: Vec<Option<KeptGene<T>>> = (0..counts.n_genes())
+    let kept: Vec<Option<KeptGene<T>>> = (0..n_genes)
         .into_par_iter()
         .map_init(
             || {
@@ -355,6 +403,10 @@ where
                     mean_log_quotient_error: summary.mean_log_quotient_error,
                     variance: summary.variance,
                 };
+                if verbose {
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    report_decile_progress(d, d - 1, n_genes, "genes", start.elapsed());
+                }
                 if !keep(view) {
                     return Ok(None);
                 }
@@ -366,6 +418,9 @@ where
         .collect::<Result<_, SanityErrors>>()?;
 
     let n_kept = kept.iter().flatten().count();
+    if verbose {
+        println!("  Kept {n_kept} / {n_genes} genes");
+    }
     let mut out = SanityOutput {
         log_fold_changes: Vec::with_capacity(n_kept * n_cells),
         error_bars: Vec::with_capacity(n_kept * n_cells),
@@ -376,9 +431,7 @@ where
         n_genes: n_kept,
         n_cells,
     };
-    // Consuming the rows frees each one once copied, so the peak stays below two
-    // copies of the kept set: 1.6x measured at 2176 genes by 1000 cells in f32,
-    // 2026-09-24.
+
     for (gene, d, e, summary) in kept.into_iter().flatten() {
         out.log_fold_changes.extend_from_slice(&d);
         out.error_bars.extend_from_slice(&e);

@@ -25,7 +25,15 @@ fn correlation(a: &[f64], b: &[f64]) -> f64 {
 }
 
 /// Simulate and run, returning the run and the truth it was drawn from.
-fn fixture(seed: u64, rule: VarianceRule) -> (sanity_sc_rs::SanityOutput<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+fn fixture(
+    seed: u64,
+    rule: VarianceRule,
+) -> (
+    sanity_sc_rs::SanityOutput<f64>,
+    Vec<f64>,
+    Vec<f64>,
+    Vec<f64>,
+) {
     let sim = simulate(Some(SimulationParams {
         n_genes: 300,
         n_cells: 400,
@@ -63,8 +71,11 @@ fn test_recovers_log_fold_changes_of_expressed_genes() {
     // Correlation with the truth rises with absolute expression, because the
     // information simply is not in the counts for a gene seen a handful of
     // times. Bucket by total UMIs and check the trend as well as the level.
-    let mut buckets: Vec<(f64, Vec<f64>)> =
-        vec![(100.0, Vec::new()), (1000.0, Vec::new()), (10000.0, Vec::new())];
+    let mut buckets: Vec<(f64, Vec<f64>)> = vec![
+        (100.0, Vec::new()),
+        (1000.0, Vec::new()),
+        (10000.0, Vec::new()),
+    ];
     for g in 0..out.n_genes {
         let row = g * out.n_cells..(g + 1) * out.n_cells;
         let k: f64 = sim.counts.gene(g).1.iter().map(|&x| x as f64).sum();
@@ -86,9 +97,21 @@ fn test_recovers_log_fold_changes_of_expressed_genes() {
         })
         .collect();
 
-    assert!(medians[0] > 0.6, "median correlation above 100 UMIs was {}", medians[0]);
-    assert!(medians[1] > 0.75, "median correlation above 1000 UMIs was {}", medians[1]);
-    assert!(medians[2] > 0.85, "median correlation above 10000 UMIs was {}", medians[2]);
+    assert!(
+        medians[0] > 0.6,
+        "median correlation above 100 UMIs was {}",
+        medians[0]
+    );
+    assert!(
+        medians[1] > 0.75,
+        "median correlation above 1000 UMIs was {}",
+        medians[1]
+    );
+    assert!(
+        medians[2] > 0.85,
+        "median correlation above 10000 UMIs was {}",
+        medians[2]
+    );
     assert!(
         medians[0] < medians[1] && medians[1] < medians[2],
         "correlation should rise with expression, got {medians:?}"
@@ -132,7 +155,10 @@ fn test_error_bars_are_calibrated() {
     let n = z.len() as f64;
     let mean = z.iter().sum::<f64>() / n;
     let sd = (z.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n).sqrt();
-    assert!(sd > 0.5 && sd < 2.0, "standardised residual spread was {sd}");
+    assert!(
+        sd > 0.5 && sd < 2.0,
+        "standardised residual spread was {sd}"
+    );
 }
 
 #[test]
@@ -159,9 +185,17 @@ fn test_f32_storage_agrees_with_f64() {
     let narrow = sanity::<f32>(&sim.counts, &sim.cell_totals, None).expect("runs");
 
     let pairs: [(&[f64], &[f32], &str); 5] = [
-        (&wide.log_fold_changes, &narrow.log_fold_changes, "log_fold_changes"),
+        (
+            &wide.log_fold_changes,
+            &narrow.log_fold_changes,
+            "log_fold_changes",
+        ),
         (&wide.error_bars, &narrow.error_bars, "error_bars"),
-        (&wide.mean_log_quotient, &narrow.mean_log_quotient, "mean_log_quotient"),
+        (
+            &wide.mean_log_quotient,
+            &narrow.mean_log_quotient,
+            "mean_log_quotient",
+        ),
         (
             &wide.mean_log_quotient_error,
             &narrow.mean_log_quotient_error,
@@ -213,7 +247,10 @@ fn test_rejects_a_non_positive_fixed_variance() {
         ..Default::default()
     };
     let err = sanity::<f64>(&counts, &[100.0, 200.0, 300.0, 50.0], Some(params)).unwrap_err();
-    assert!(matches!(err, SanityErrors::InvalidFixedVariance { variance: 0.0 }));
+    assert!(matches!(
+        err,
+        SanityErrors::InvalidFixedVariance { variance: 0.0 }
+    ));
 }
 
 #[test]
@@ -256,7 +293,11 @@ fn test_single_umi_gene_stays_finite() {
 
     // With nothing to go on the variance posterior stays near the prior, which
     // over a log-uniform grid to 50 has a mean well above one.
-    assert!(out.variance[0] > 1.0, "single UMI gene variance {}", out.variance[0]);
+    assert!(
+        out.variance[0] > 1.0,
+        "single UMI gene variance {}",
+        out.variance[0]
+    );
 }
 
 #[test]
@@ -276,5 +317,8 @@ fn test_rejects_a_cell_with_no_library() {
 
     let counts = CountMatrix::new(vec![0, 2], vec![3, 5], vec![0, 2], 4).expect("well formed");
     let err = sanity::<f64>(&counts, &[100.0, 0.0, 300.0, 50.0], None).unwrap_err();
-    assert!(matches!(err, SanityErrors::NonPositiveCellTotal { index: 1, .. }));
+    assert!(matches!(
+        err,
+        SanityErrors::NonPositiveCellTotal { index: 1, .. }
+    ));
 }

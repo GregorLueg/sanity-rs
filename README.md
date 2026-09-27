@@ -50,13 +50,47 @@ let kept = sanity_select::<f32, _>(&counts, &cell_totals, None, |g| g.variance >
 
 Storage is `f32` or `f64`. Every reduction accumulates in `f64` either way.
 
+Want to see where more or less details? Set the verbosity.
+
+```rust
+use sanity_sc_rs::config::Verbosity;
+
+// more details
+let params = SanityParams {
+    verbosity: Verbosity::Detailed,
+    ..SanityParams::default()
+};
+
+// quiet
+let params = SanityParams {
+    verbosity: Verbosity::Quiet,
+    ..SanityParams::default()
+};
+```
+
+`Normal` prints a header and a progress line at every tenth of the genes.
+`Detailed` adds a per-batch stage split on the GPU. The default is `Quiet`.
+
 ### Handing over to Bonsai
 
-Bonsai's means are `log_transcription_quotients()` and its standard deviations
-are `error_bars`. Watch the layout: Sanity writes gene-major
-(`g * n_cells + c`), Bonsai reads row-major `[cell][gene]`, so transpose both
-before the call. `sanity_select` with a signal-to-noise predicate drops the
-uninformative genes before they're ever stored.
+Don't wire this up by hand. Turn on bonsai-rs's `sanity` feature and pass the
+output straight to `ingest::from_sanity_output`. It transposes to Bonsai's
+`[cell][gene]`, undoes Sanity's prior shrinkage with `variance` (S5 in the
+Bonsai supplement) and drops the genes where that inversion is ill-conditioned.
+
+```rust
+use bonsai_rs::bonsai::bonsai;
+use bonsai_rs::ingest::from_sanity_output;
+
+let post = sanity::<f32>(&counts, &cell_totals, None)?;
+let lik = from_sanity_output(&post, None)?;
+let out = bonsai(&lik.means, &lik.sds, lik.n_cells, lik.features.len(), Some(&lik.variances), None)?;
+```
+
+Bonsai reads `log_fold_changes`, not `log_transcription_quotients()`: S5
+inverts the zero-mean prior on `d_c`, and adding `m` back breaks it.
+`sanity_gpu` output goes in unchanged, and so does `sanity_select` output; its
+`genes` carry the input indices through to `lik.features`.
 
 ### Variance rules
 

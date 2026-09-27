@@ -50,6 +50,8 @@
 
 pub mod kernels;
 
+use std::time::{Duration, Instant};
+
 use cubecl::prelude::*;
 use cubecl_utils_rs::prelude::*;
 use rayon::prelude::*;
@@ -62,7 +64,8 @@ use crate::model::gene::{
     MARGINALISE_MIN_WEIGHT, collapse_target, log_marginal_at, marginal_summary, posterior_weights,
 };
 use crate::utils::polygamma::{digamma, trigamma};
-use crate::{SanityOutput, prepare_run};
+use crate::utils::progress::report_decile_progress;
+use crate::{SanityOutput, prepare_run, print_run_header};
 
 use self::kernels::{marginalise_gpu, sweep_grid_gpu};
 
@@ -629,6 +632,15 @@ fn sanity_gpu_batched<T: SanityFloat, R: Runtime>(
     let budget = batch_bytes.min(limits.max_binding_bytes);
     let batch_genes = ((budget / row_bytes) as usize).clamp(1, n_genes.max(1));
 
+    let verbose = params.verbosity.normal_verbosity();
+    let detailed = params.verbosity.detailed_verbosity();
+    let n_batches = n_genes.div_ceil(batch_genes);
+    if verbose {
+        print_run_header("GPU", n_genes, n_cells, &params);
+        println!("  Batches: {n_batches}, up to {batch_genes} genes each");
+    }
+    let start = Instant::now();
+
     let log_totals_f32: Vec<f32> = log_totals.iter().map(|&x| x as f32).collect();
     let log_totals_dev = GpuTensor::<R, f32>::from_slice(&log_totals_f32, vec![n_cells], client)?;
 
@@ -645,9 +657,20 @@ fn sanity_gpu_batched<T: SanityFloat, R: Runtime>(
 
     let mut first = 0;
     while first < n_genes {
+        // Stage wall times for `Detailed`. `run_sweep` and `run_marginalise`
+        // read back to the host, so each lap ends synchronised; an upload the
+        // runtime defers lands in the sweep after it rather than in `stage`.
+        let mut laps: Vec<(&str, Duration)> = Vec::new();
+        let mut t = Instant::now();
+        let mut lap = |name| {
+            laps.push((name, t.elapsed()));
+            t = Instant::now();
+        };
+
         let n = batch_genes.min(n_genes - first);
         let batch = stage_batch(counts, first, n, client)?;
         let ks = &batch.totals;
+        lap("stage");
 
         let (sweep, weights, summaries) = match params.variance_rule {
             VarianceRule::Fixed(v) => {
@@ -662,6 +685,7 @@ fn sanity_gpu_batched<T: SanityFloat, R: Runtime>(
                     true,
                     client,
                 )?;
+                lap("sweep");
                 let summaries: Vec<(f64, f64, f64)> = (0..n)
                     .map(|g| (digamma(ks[g]) - sweep.offsets[g], trigamma(ks[g]).sqrt(), v))
                     .collect();
@@ -680,6 +704,7 @@ fn sanity_gpu_batched<T: SanityFloat, R: Runtime>(
                     true,
                     client,
                 )?;
+                lap("sweep");
 
                 let per_gene: Vec<(Vec<f64>, Vec<f64>, Vec<f64>)> =
                     bin_likelihoods(&batch, &sweep, &grid.values, n_cells)
@@ -715,6 +740,7 @@ fn sanity_gpu_batched<T: SanityFloat, R: Runtime>(
                             }
                         })
                         .collect();
+                    lap("host");
                     (sweep, weights, summaries)
                 } else {
                     let targets: Vec<(f64, f64, f64)> = per_gene
@@ -739,6 +765,7 @@ fn sanity_gpu_batched<T: SanityFloat, R: Runtime>(
                         .collect::<Result<_, SanityErrors>>()?;
                     let bin_v: Vec<f64> = targets.iter().map(|t| t.0).collect();
                     let guess: Vec<f64> = targets.iter().map(|t| t.1).collect();
+                    lap("host");
                     drop(sweep);
                     let point = run_sweep(
                         &batch,
@@ -750,6 +777,7 @@ fn sanity_gpu_batched<T: SanityFloat, R: Runtime>(
                         false,
                         client,
                     )?;
+                    lap("re-solve");
                     let summaries = (0..n)
                         .map(|g| {
                             (
@@ -778,6 +806,22 @@ fn sanity_gpu_batched<T: SanityFloat, R: Runtime>(
             out.mean_log_quotient[first + g] = narrow(m);
             out.mean_log_quotient_error[first + g] = narrow(dm);
             out.variance[first + g] = narrow(v);
+        }
+        lap("second pass");
+
+        if detailed {
+            let split: Vec<String> = laps
+                .iter()
+                .map(|(name, d)| format!("{name} {d:.2?}"))
+                .collect();
+            println!(
+                "  Batch {}/{n_batches} ({n} genes): {}",
+                first / batch_genes + 1,
+                split.join(", ")
+            );
+        }
+        if verbose {
+            report_decile_progress(first + n, first, n_genes, "genes", start.elapsed());
         }
         first += n;
     }

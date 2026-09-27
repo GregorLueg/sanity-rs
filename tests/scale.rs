@@ -4,7 +4,7 @@
 //! with `C`. Equal `T_c` is the worst case for it, and is what a downsampled or
 //! synthetic matrix looks like.
 
-use sanity_sc_rs::config::{SanityParams, VarianceRule};
+use sanity_sc_rs::config::{SanityParams, VarianceRule, Verbosity};
 use sanity_sc_rs::input::CountMatrix;
 use sanity_sc_rs::sanity;
 
@@ -19,7 +19,7 @@ fn uniform_gene_variance(n_cells: usize) -> f64 {
     let indptr = vec![0, indices.len()];
     let counts = CountMatrix::new(indices, values, indptr, n_cells).expect("well formed");
     let totals = vec![5000.0; n_cells];
-    let params = SanityParams::new(VarianceRule::Marginalise, 1e-3, 50.0, 21);
+    let params = SanityParams::new(VarianceRule::Marginalise, 1e-3, 50.0, 21, Verbosity::Quiet);
     let out = sanity::<f64>(&counts, &totals, Some(params)).expect("runs");
     out.variance[0]
 }
