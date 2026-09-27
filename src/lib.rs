@@ -376,9 +376,7 @@ where
         n_genes: n_kept,
         n_cells,
     };
-    // Consuming the rows frees each one once copied, so the peak stays below two
-    // copies of the kept set: 1.6x measured at 2176 genes by 1000 cells in f32,
-    // 2026-09-24.
+
     for (gene, d, e, summary) in kept.into_iter().flatten() {
         out.log_fold_changes.extend_from_slice(&d);
         out.error_bars.extend_from_slice(&e);
