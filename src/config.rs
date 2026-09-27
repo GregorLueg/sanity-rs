@@ -164,7 +164,7 @@ impl Default for SanityParams {
             variance_min: DEFAULT_VARIANCE_MIN,
             variance_max: DEFAULT_VARIANCE_MAX,
             variance_bins: DEFAULT_VARIANCE_BINS,
-            verbosity: Verbosity::Quiet,
+            verbosity: Verbosity::Normal,
         }
     }
 }

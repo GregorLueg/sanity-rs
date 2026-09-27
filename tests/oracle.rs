@@ -65,9 +65,12 @@ fn load(path: &str) -> Oracle {
                 )
             }
             "totals" => o.totals = rest.iter().map(|x| x.parse().unwrap()).collect(),
-            "indices" => o.indices.extend(rest.iter().map(|x| x.parse::<u32>().unwrap())),
+            "indices" => o
+                .indices
+                .extend(rest.iter().map(|x| x.parse::<u32>().unwrap())),
             "values" => {
-                o.values.extend(rest.iter().map(|x| x.parse::<u32>().unwrap()));
+                o.values
+                    .extend(rest.iter().map(|x| x.parse::<u32>().unwrap()));
                 o.indptr.push(o.indices.len());
             }
             "summary" => {
@@ -75,8 +78,12 @@ fn load(path: &str) -> Oracle {
                 o.mean_error.push(rest[1].parse().unwrap());
                 o.variance.push(rest[2].parse().unwrap());
             }
-            "fold" => o.fold.extend(rest.iter().map(|x| x.parse::<f64>().unwrap())),
-            "error" => o.error.extend(rest.iter().map(|x| x.parse::<f64>().unwrap())),
+            "fold" => o
+                .fold
+                .extend(rest.iter().map(|x| x.parse::<f64>().unwrap())),
+            "error" => o
+                .error
+                .extend(rest.iter().map(|x| x.parse::<f64>().unwrap())),
             _ => {}
         }
     }

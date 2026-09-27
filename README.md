@@ -50,13 +50,20 @@ let kept = sanity_select::<f32, _>(&counts, &cell_totals, None, |g| g.variance >
 
 Storage is `f32` or `f64`. Every reduction accumulates in `f64` either way.
 
-Want to see where a long run is? Set the verbosity:
+Want to see where more or less details? Set the verbosity.
 
 ```rust
 use sanity_sc_rs::config::Verbosity;
 
+// more details
 let params = SanityParams {
-    verbosity: Verbosity::Normal,
+    verbosity: Verbosity::Detailed,
+    ..SanityParams::default()
+};
+
+// quiet
+let params = SanityParams {
+    verbosity: Verbosity::Quiet,
     ..SanityParams::default()
 };
 ```
