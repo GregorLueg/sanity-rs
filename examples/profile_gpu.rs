@@ -1,7 +1,8 @@
 //! CPU against GPU, every variance rule: wall clock and agreement.
 //!
-//! Positional arguments: n_genes n_cells n_bins seed library_size [rule], where
-//! `rule` is one of `marginalise`, `mean`, `max`, `fixed`; all four if absent.
+//! Positional arguments: n_genes n_cells n_bins seed library_size [rule]
+//! [verbosity], where `rule` is one of `marginalise`, `mean`, `max`, `fixed`;
+//! all four if absent. `verbosity` is 0, 1 or 2.
 //!
 //! cargo run --release --features gpu --example profile_gpu -- 500 20000
 
@@ -9,7 +10,7 @@ use std::time::Instant;
 
 use cubecl::prelude::*;
 use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
-use sanity_sc_rs::config::{DEFAULT_VARIANCE_BINS, SanityParams, VarianceRule};
+use sanity_sc_rs::config::{DEFAULT_VARIANCE_BINS, SanityParams, VarianceRule, Verbosity};
 use sanity_sc_rs::gpu::sanity_gpu;
 use sanity_sc_rs::sanity;
 use sanity_sc_rs::simulate::{SimulationParams, simulate};
@@ -33,6 +34,11 @@ fn main() {
     let n_bins = arg(2, DEFAULT_VARIANCE_BINS);
     let seed = arg(3, 0) as u64;
     let library_size = arg(4, 500) as f64;
+    let verbosity = match arg(6, 0) {
+        0 => Verbosity::Quiet,
+        1 => Verbosity::Normal,
+        _ => Verbosity::Detailed,
+    };
 
     let sim = simulate(Some(SimulationParams {
         n_genes,
@@ -47,7 +53,13 @@ fn main() {
 
     let client = WgpuRuntime::client(&WgpuDevice::default());
     // Compile both kernels before anything is timed.
-    let warm = SanityParams::new(VarianceRule::Marginalise, 1e-3, 50.0, n_bins);
+    let warm = SanityParams::new(
+        VarianceRule::Marginalise,
+        1e-3,
+        50.0,
+        n_bins,
+        Verbosity::Quiet,
+    );
     sanity_gpu::<f64, WgpuRuntime>(&sim.counts, &sim.cell_totals, Some(warm), &client)
         .expect("warm-up run");
 
@@ -66,7 +78,7 @@ fn main() {
         Some("fixed") => matches!(rule, VarianceRule::Fixed(_)),
         Some(other) => panic!("unknown rule {other}"),
     }) {
-        let params = SanityParams::new(rule, 1e-3, 50.0, n_bins);
+        let params = SanityParams::new(rule, 1e-3, 50.0, n_bins, verbosity);
         let start = Instant::now();
         let cpu = sanity::<f64>(&sim.counts, &sim.cell_totals, Some(params)).expect("CPU run");
         let t_cpu = start.elapsed().as_secs_f64();

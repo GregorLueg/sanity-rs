@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.2.0
+
+* Progress reporting via `SanityParams::verbosity` and the new `Verbosity`
+  enum (`Quiet`, `Normal`, `Detailed`), on `sanity`, `sanity_select` and
+  `sanity_gpu`. `Normal` prints a header and a line at every tenth of the
+  genes; `Detailed` adds a per-batch stage split on the GPU. Default is
+  `Quiet`.
+* Breaking: `SanityParams::new` takes a trailing `verbosity`. Struct literals
+  that end in `..SanityParams::default()` compile unchanged.
+* README: the hand-over to Bonsai goes through bonsai-rs's
+  `ingest::from_sanity_output`, which reads `log_fold_changes`, not the log
+  transcription quotients.
+
 ## v0.1.0
 
 * GPU-accelerated Sanity added via the wgpu/cubecl framework, behind the `gpu`

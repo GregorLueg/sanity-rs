@@ -12,7 +12,7 @@
 //!     --v-bins 64 --out tests/data/oracle.txt
 //! ```
 
-use sanity_sc_rs::config::{SanityParams, VarianceRule};
+use sanity_sc_rs::config::{SanityParams, VarianceRule, Verbosity};
 use sanity_sc_rs::input::CountMatrix;
 use sanity_sc_rs::sanity;
 
@@ -102,7 +102,13 @@ fn test_matches_the_numpy_oracle() {
     )
     .expect("the fixture is well formed");
 
-    let params = SanityParams::new(VarianceRule::Marginalise, o.grid.0, o.grid.1, o.grid.2);
+    let params = SanityParams::new(
+        VarianceRule::Marginalise,
+        o.grid.0,
+        o.grid.1,
+        o.grid.2,
+        Verbosity::Quiet,
+    );
     let out = sanity::<f64>(&counts, &o.totals, Some(params)).expect("the run succeeds");
 
     assert_eq!(out.n_genes, o.n_genes);

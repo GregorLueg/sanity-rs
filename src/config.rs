@@ -75,6 +75,42 @@ impl VarianceRule {
     }
 }
 
+/// How much a run prints to stdout.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Verbosity {
+    /// Nothing at all. The default.
+    #[default]
+    Quiet,
+    /// A header, progress over genes at every tenth of the run, and the total
+    /// time.
+    Normal,
+    /// As [`Verbosity::Normal`], plus a per-batch stage split on the GPU. The
+    /// CPU path prints nothing extra.
+    Detailed,
+}
+
+impl Verbosity {
+    /// Whether normal or detailed output is on.
+    ///
+    /// ### Returns
+    ///
+    /// `true` for [`Verbosity::Normal`] and [`Verbosity::Detailed`].
+    #[inline]
+    pub fn normal_verbosity(&self) -> bool {
+        matches!(self, Verbosity::Normal | Verbosity::Detailed)
+    }
+
+    /// Whether detailed output is on.
+    ///
+    /// ### Returns
+    ///
+    /// `true` for [`Verbosity::Detailed`] only.
+    #[inline]
+    pub fn detailed_verbosity(&self) -> bool {
+        matches!(self, Verbosity::Detailed)
+    }
+}
+
 /// Parameters for a Sanity run.
 #[derive(Clone, Copy, Debug)]
 pub struct SanityParams {
@@ -86,6 +122,8 @@ pub struct SanityParams {
     pub variance_max: f64,
     /// Number of grid bins, equally spaced in `ln v`.
     pub variance_bins: usize,
+    /// How much the run prints.
+    pub verbosity: Verbosity,
 }
 
 impl SanityParams {
@@ -97,6 +135,7 @@ impl SanityParams {
     /// * `variance_min` - Lower bound of the variance grid.
     /// * `variance_max` - Upper bound of the variance grid.
     /// * `variance_bins` - Number of grid bins.
+    /// * `verbosity` - How much the run prints.
     ///
     /// ### Returns
     ///
@@ -106,12 +145,14 @@ impl SanityParams {
         variance_min: f64,
         variance_max: f64,
         variance_bins: usize,
+        verbosity: Verbosity,
     ) -> Self {
         Self {
             variance_rule,
             variance_min,
             variance_max,
             variance_bins,
+            verbosity,
         }
     }
 }
@@ -123,6 +164,7 @@ impl Default for SanityParams {
             variance_min: DEFAULT_VARIANCE_MIN,
             variance_max: DEFAULT_VARIANCE_MAX,
             variance_bins: DEFAULT_VARIANCE_BINS,
+            verbosity: Verbosity::Quiet,
         }
     }
 }

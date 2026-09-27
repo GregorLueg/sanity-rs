@@ -8,8 +8,8 @@
 //! samply record -- ./target/release/examples/profile_sanity 2000 20000
 //! ```
 //!
-//! Arguments are `n_genes`, `n_cells`, `n_bins`, `seed`, `library_size`, all
-//! optional and positional.
+//! Arguments are `n_genes`, `n_cells`, `n_bins`, `seed`, `library_size` and
+//! `verbosity` (0, 1 or 2), all optional and positional.
 //!
 //! The default library size tracks the gene count at a quarter of a UMI per
 //! gene per cell, which is the ratio a droplet experiment has (20 000 genes,
@@ -19,7 +19,7 @@
 
 use std::time::Instant;
 
-use sanity_sc_rs::config::{DEFAULT_VARIANCE_BINS, SanityParams, VarianceRule};
+use sanity_sc_rs::config::{DEFAULT_VARIANCE_BINS, SanityParams, VarianceRule, Verbosity};
 use sanity_sc_rs::sanity;
 use sanity_sc_rs::simulate::{SimulationParams, simulate};
 
@@ -35,6 +35,11 @@ fn main() {
     let n_bins = arg(2, DEFAULT_VARIANCE_BINS);
     let seed = arg(3, 0) as u64;
     let library_size = arg(4, n_genes / 4) as f64;
+    let verbosity = match arg(5, 0) {
+        0 => Verbosity::Quiet,
+        1 => Verbosity::Normal,
+        _ => Verbosity::Detailed,
+    };
 
     let sim_params = SimulationParams {
         n_genes,
@@ -60,7 +65,7 @@ fn main() {
         VarianceRule::MaxPosterior,
         VarianceRule::Fixed(1.0),
     ] {
-        let params = SanityParams::new(rule, 1e-3, 50.0, n_bins);
+        let params = SanityParams::new(rule, 1e-3, 50.0, n_bins, verbosity);
         let start = Instant::now();
         let out = sanity::<f64>(&sim.counts, &sim.cell_totals, Some(params))
             .expect("the simulated matrix is well formed");
