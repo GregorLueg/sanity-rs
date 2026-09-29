@@ -65,7 +65,7 @@ use crate::model::gene::{
 };
 use crate::utils::polygamma::{digamma, trigamma};
 use crate::utils::progress::report_decile_progress;
-use crate::{SanityOutput, prepare_run, print_run_header};
+use crate::{GeneView, SanityOutput, prepare_run, print_run_header};
 
 use self::kernels::{marginalise_gpu, sweep_grid_gpu};
 
@@ -599,7 +599,53 @@ pub fn sanity_gpu<T: SanityFloat, R: Runtime>(
     params: Option<SanityParams>,
     client: &ComputeClient<R>,
 ) -> Result<SanityOutput<T>, SanityErrors> {
-    sanity_gpu_batched(counts, cell_totals, params, client, GPU_BATCH_BYTES)
+    sanity_gpu_batched(counts, cell_totals, params, client, GPU_BATCH_BYTES, |_| {
+        true
+    })
+}
+
+/// Run Sanity on the GPU and store only the genes a predicate keeps.
+///
+/// The GPU twin of [`crate::sanity_select`]. Each batch comes back to the host
+/// anyway, so the predicate runs there, per gene, before anything is stored:
+/// resident output is one batch plus the kept genes, not `2 * n_genes *
+/// n_cells` values.
+///
+/// The [`GeneView`] rows are the device's `f32` values widened to `f64`, so a
+/// predicate sitting on a threshold can decide a borderline gene differently
+/// from the CPU run.
+///
+/// ### Params
+///
+/// * `counts` - Raw UMI counts, gene-major sparse.
+/// * `cell_totals` - Total UMI count of every cell over *all* genes.
+/// * `params` - Run parameters, or [`SanityParams::default`].
+/// * `client` - CubeCL compute client.
+/// * `keep` - Returns `true` for a gene to store. Called once per gene, from
+///   any Rayon worker.
+///
+/// ### Returns
+///
+/// The kept genes in input order, with their input indices in
+/// [`SanityOutput::genes`]. Keeping nothing is not an error; the output is then
+/// empty.
+pub fn sanity_gpu_select<T, R, F>(
+    counts: &CountMatrix,
+    cell_totals: &[f64],
+    params: Option<SanityParams>,
+    client: &ComputeClient<R>,
+    keep: F,
+) -> Result<SanityOutput<T>, SanityErrors>
+where
+    T: SanityFloat,
+    R: Runtime,
+    F: Fn(GeneView<'_>) -> bool + Sync,
+{
+    let out = sanity_gpu_batched(counts, cell_totals, params, client, GPU_BATCH_BYTES, keep)?;
+    if params.unwrap_or_default().verbosity.normal_verbosity() {
+        println!("  Kept {} / {} genes", out.n_genes, counts.n_genes());
+    }
+    Ok(out)
 }
 
 /// [`sanity_gpu`] with the batch budget as a parameter.
@@ -611,17 +657,24 @@ pub fn sanity_gpu<T: SanityFloat, R: Runtime>(
 /// * `params` - Run parameters, or [`SanityParams::default`].
 /// * `client` - CubeCL compute client.
 /// * `batch_bytes` - Ceiling on the largest buffer of one batch.
+/// * `keep` - Per-gene predicate, as for [`sanity_gpu_select`].
 ///
 /// ### Returns
 ///
-/// As [`sanity_gpu`].
-fn sanity_gpu_batched<T: SanityFloat, R: Runtime>(
+/// As [`sanity_gpu_select`].
+fn sanity_gpu_batched<T, R, F>(
     counts: &CountMatrix,
     cell_totals: &[f64],
     params: Option<SanityParams>,
     client: &ComputeClient<R>,
     batch_bytes: u64,
-) -> Result<SanityOutput<T>, SanityErrors> {
+    keep: F,
+) -> Result<SanityOutput<T>, SanityErrors>
+where
+    T: SanityFloat,
+    R: Runtime,
+    F: Fn(GeneView<'_>) -> bool + Sync,
+{
     let params = params.unwrap_or_default();
     let n_cells = counts.n_cells();
     let n_genes = counts.n_genes();
@@ -645,13 +698,13 @@ fn sanity_gpu_batched<T: SanityFloat, R: Runtime>(
     let log_totals_dev = GpuTensor::<R, f32>::from_slice(&log_totals_f32, vec![n_cells], client)?;
 
     let mut out = SanityOutput {
-        log_fold_changes: vec![T::zero(); n_genes * n_cells],
-        error_bars: vec![T::zero(); n_genes * n_cells],
-        mean_log_quotient: vec![T::zero(); n_genes],
-        mean_log_quotient_error: vec![T::zero(); n_genes],
-        variance: vec![T::zero(); n_genes],
-        genes: (0..n_genes).collect(),
-        n_genes,
+        log_fold_changes: Vec::new(),
+        error_bars: Vec::new(),
+        mean_log_quotient: Vec::new(),
+        mean_log_quotient_error: Vec::new(),
+        variance: Vec::new(),
+        genes: Vec::new(),
+        n_genes: 0,
         n_cells,
     };
 
@@ -793,19 +846,41 @@ fn sanity_gpu_batched<T: SanityFloat, R: Runtime>(
         };
 
         let rows = run_marginalise(&batch, &log_totals_dev, n_cells, &sweep, &weights, client)?;
-        let span = first * n_cells..(first + n) * n_cells;
-        out.log_fold_changes[span.clone()]
-            .par_iter_mut()
-            .zip(&rows[..n * n_cells])
-            .for_each(|(o, &x)| *o = narrow(x as f64));
-        out.error_bars[span]
-            .par_iter_mut()
-            .zip(&rows[n * n_cells..])
-            .for_each(|(o, &x)| *o = narrow(x as f64));
-        for (g, (m, dm, v)) in summaries.into_iter().enumerate() {
-            out.mean_log_quotient[first + g] = narrow(m);
-            out.mean_log_quotient_error[first + g] = narrow(dm);
-            out.variance[first + g] = narrow(v);
+        let (lfc, eb) = rows.split_at(n * n_cells);
+        let kept: Vec<bool> = (0..n)
+            .into_par_iter()
+            .map_init(
+                || (vec![0.0f64; n_cells], vec![0.0f64; n_cells]),
+                |(d, e), g| {
+                    let lo = g * n_cells;
+                    for c in 0..n_cells {
+                        d[c] = lfc[lo + c] as f64;
+                        e[c] = eb[lo + c] as f64;
+                    }
+                    let (m, dm, v) = summaries[g];
+                    keep(GeneView {
+                        log_fold_changes: d,
+                        error_bars: e,
+                        mean_log_quotient: m,
+                        mean_log_quotient_error: dm,
+                        variance: v,
+                    })
+                },
+            )
+            .collect();
+        for (g, &(m, dm, v)) in summaries.iter().enumerate() {
+            if !kept[g] {
+                continue;
+            }
+            let lo = g * n_cells;
+            out.log_fold_changes
+                .extend(lfc[lo..lo + n_cells].iter().map(|&x| narrow::<T>(x as f64)));
+            out.error_bars
+                .extend(eb[lo..lo + n_cells].iter().map(|&x| narrow::<T>(x as f64)));
+            out.mean_log_quotient.push(narrow(m));
+            out.mean_log_quotient_error.push(narrow(dm));
+            out.variance.push(narrow(v));
+            out.genes.push(first + g);
         }
         lap("second pass");
 
@@ -826,6 +901,7 @@ fn sanity_gpu_batched<T: SanityFloat, R: Runtime>(
         first += n;
     }
 
+    out.n_genes = out.genes.len();
     Ok(out)
 }
 
@@ -838,6 +914,64 @@ mod tests {
     use super::*;
     use crate::simulate::{SimulationParams, simulate};
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+
+    #[test]
+    fn test_gpu_select_keeps_the_full_run_rows_it_selects() {
+        let sim = simulate(Some(SimulationParams {
+            n_genes: 50,
+            n_cells: 2000,
+            library_size: 500.0,
+            seed: 5,
+            ..Default::default()
+        }))
+        .expect("simulates");
+        let client = WgpuRuntime::client(&WgpuDevice::default());
+        let full: SanityOutput<f32> =
+            sanity_gpu(&sim.counts, &sim.cell_totals, None, &client).expect("runs");
+
+        let mut sorted = full.variance.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        // between two stored values, so the f64 the predicate sees and the f32
+        // stored here cannot fall on opposite sides of it
+        let mid = sorted.len() / 2;
+        let cut = 0.5 * (sorted[mid - 1] as f64 + sorted[mid] as f64);
+        let n_cells = full.n_cells;
+        // seven genes per batch, so the selection crosses batch boundaries
+        let row_bytes = 2 * n_cells as u64 * size_of::<f32>() as u64;
+        let picked: SanityOutput<f32> = sanity_gpu_batched(
+            &sim.counts,
+            &sim.cell_totals,
+            None,
+            &client,
+            7 * row_bytes,
+            |g| g.variance > cut,
+        )
+        .expect("runs");
+
+        let expected: Vec<usize> = (0..full.n_genes)
+            .filter(|&g| full.variance[g] as f64 > cut)
+            .collect();
+        assert_eq!(picked.genes, expected);
+        assert_eq!(picked.n_genes, expected.len());
+        for (row, &g) in expected.iter().enumerate() {
+            let (a, b) = (row * n_cells, g * n_cells);
+            assert_eq!(
+                picked.log_fold_changes[a..a + n_cells],
+                full.log_fold_changes[b..b + n_cells]
+            );
+            assert_eq!(
+                picked.error_bars[a..a + n_cells],
+                full.error_bars[b..b + n_cells]
+            );
+            assert_eq!(picked.variance[row], full.variance[g]);
+        }
+
+        let none: SanityOutput<f32> =
+            sanity_gpu_select(&sim.counts, &sim.cell_totals, None, &client, |_| false)
+                .expect("runs");
+        assert_eq!(none.n_genes, 0);
+        assert!(none.log_fold_changes.is_empty());
+    }
 
     #[test]
     fn test_gpu_batching_does_not_change_the_output() {
@@ -854,9 +988,15 @@ mod tests {
             sanity_gpu(&sim.counts, &sim.cell_totals, None, &client).expect("runs in one batch");
         // Seven genes per batch, so the last batch is ragged.
         let row_bytes = 2 * 2000 * size_of::<f32>() as u64;
-        let split: SanityOutput<f32> =
-            sanity_gpu_batched(&sim.counts, &sim.cell_totals, None, &client, 7 * row_bytes)
-                .expect("runs in batches");
+        let split: SanityOutput<f32> = sanity_gpu_batched(
+            &sim.counts,
+            &sim.cell_totals,
+            None,
+            &client,
+            7 * row_bytes,
+            |_| true,
+        )
+        .expect("runs in batches");
         assert_eq!(split.log_fold_changes, whole.log_fold_changes);
         assert_eq!(split.error_bars, whole.error_bars);
         assert_eq!(split.mean_log_quotient, whole.mean_log_quotient);
