@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.1
+
+### Features
+
+* The GPU-accelerated form of Sanity also got a filter gene option to only
+  keep these genes.
+
 ## v0.2.0
 
 ### Features
