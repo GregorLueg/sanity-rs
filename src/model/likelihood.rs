@@ -309,14 +309,23 @@ mod tests {
                     &mut log_omega,
                 )
                 .expect("converges");
-                // Cold, like the dense solve above: the warm start is built
-                // for neighbouring grid bins, not jumps of this size.
-                cells.state = None;
+                // Warm across jumps far larger than a grid step, which is
+                // what `log_omega_near`'s cold restart is for.
                 let sparse =
                     solve_stationary_sparse(v, s, n_cells, guess, &table, &log_totals, &mut cells)
                         .expect("converges");
 
-                assert_relative_eq!(sparse.z, dense.z, epsilon = 1e-11);
+                // Both solves stop anywhere inside the residual tolerance, a
+                // band `tol / S_A` wide in `z`; this mirrors `solve_offset`'s
+                // `tol` with a tenfold margin.
+                let tol = v * s * 1e-13_f64.max(4.0 * n_cells as f64 * f64::EPSILON);
+                let band = 10.0 * tol / dense.curvature_sum.min(sparse.curvature_sum);
+                assert!(
+                    (sparse.z - dense.z).abs() <= band,
+                    "gene {g}, v {v}: z {} vs {}, band {band:e}",
+                    sparse.z,
+                    dense.z
+                );
                 assert_relative_eq!(
                     sparse.curvature_sum,
                     dense.curvature_sum,

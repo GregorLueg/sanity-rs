@@ -653,7 +653,7 @@ fn collapse(
     let point = match table {
         Some(table) => {
             // Cold per-cell state: the last sweep sat at the top of the grid,
-            // too far from `v` for the warm start's prediction.
+            // far from `v`, so a warm prediction would start far off.
             scratch.nonzero.state = None;
             solve_stationary_sparse(
                 v,

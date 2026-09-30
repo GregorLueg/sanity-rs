@@ -32,9 +32,11 @@ const OMEGA_TOL: f64 = 1e-14;
 
 /// Iteration cap for the Halley solve.
 ///
-/// Halley is cubic and the initial guesses below are within one unit of the
-/// root over the whole domain, so four iterations are ample. The cap exists to
-/// make a non-finite input terminate rather than spin.
+/// Halley is cubic and the cold guesses below are within one unit of the root
+/// over the whole domain, so four iterations are ample from them. A warm start
+/// predicted across a large jump can sit far above the root, where the Newton
+/// fallback only gains about one unit per step; [`log_omega_near`] then hits
+/// the cap and restarts cold rather than return an unconverged root.
 const OMEGA_MAX_ITER: usize = 8;
 
 /// Above this argument the large-`x` initial guess `ln(x - ln x)` is used.
@@ -67,7 +69,7 @@ pub(crate) fn log_omega(x: f64) -> f64 {
     } else {
         x
     };
-    refine(x, t)
+    refine(x, t).0
 }
 
 /// Solve `exp(t) + t = x` starting from the solution at a nearby argument.
@@ -93,15 +95,21 @@ pub(crate) fn log_omega(x: f64) -> f64 {
 /// ### Returns
 ///
 /// `ln omega(x)`. Falls back to the cold guess if the prediction is not finite,
-/// which a caller passing a stale or non-finite previous state can provoke.
+/// which a caller passing a stale or non-finite previous state can provoke, or
+/// if the iteration from it does not converge within [`OMEGA_MAX_ITER`]. The
+/// prediction is a tangent to a concave function, so a large `dx` from a small
+/// `omega_prev` overshoots far above the root; without the restart that
+/// returned an unconverged root silently.
 #[inline]
 pub(crate) fn log_omega_near(x: f64, dx: f64, t_prev: f64, omega_prev: f64) -> f64 {
     let t = t_prev + dx / (1.0 + omega_prev);
     if t.is_finite() {
-        refine(x, t)
-    } else {
-        log_omega(x)
+        let (t, converged) = refine(x, t);
+        if converged {
+            return t;
+        }
     }
+    log_omega(x)
 }
 
 /// Halley iteration on `g(t) = exp(t) + t - x` from a starting point.
@@ -125,14 +133,15 @@ pub(crate) fn log_omega_near(x: f64, dx: f64, t_prev: f64, omega_prev: f64) -> f
 ///
 /// ### Returns
 ///
-/// `ln omega(x)`.
+/// The last iterate for `ln omega(x)`, and whether it met [`OMEGA_TOL`] within
+/// [`OMEGA_MAX_ITER`] iterations.
 #[inline(always)]
-fn refine(x: f64, mut t: f64) -> f64 {
+fn refine(x: f64, mut t: f64) -> (f64, bool) {
     for _ in 0..OMEGA_MAX_ITER {
         let e = t.exp();
         let g = e + t - x;
         if g.abs() < OMEGA_TOL * (1.0 + e) {
-            break;
+            return (t, true);
         }
         // Halley: t -= 2 g g' / (2 g'^2 - g g''), with g' = e + 1 and g'' = e.
         let d1 = e + 1.0;
@@ -144,7 +153,7 @@ fn refine(x: f64, mut t: f64) -> f64 {
         };
     }
 
-    t
+    (t, false)
 }
 
 /// Recover `omega(x)` from `x` and `t = ln omega(x)` without cancellation.
@@ -242,5 +251,21 @@ mod tests {
         // through its logarithm, and the log branch must still be exact.
         let t = log_omega(-700.0);
         assert_relative_eq!(t, -700.0, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn test_omega_near_survives_a_large_jump() {
+        // A warm start from a tiny omega across a large dx predicts far above
+        // the root; the result must still be the cold root.
+        for &(x_prev, x) in &[(-10.0, 10.0), (-20.0, 30.0), (-5.0, 100.0), (0.0, 1e3)] {
+            let t_prev = log_omega(x_prev);
+            let omega_prev = omega_from_log(x_prev, t_prev);
+            let t = log_omega_near(x, x - x_prev, t_prev, omega_prev);
+            let want = log_omega(x);
+            assert!(
+                (t - want).abs() < 1e-13 * want.abs().max(1.0),
+                "x = {x}: {t} vs {want}"
+            );
+        }
     }
 }
