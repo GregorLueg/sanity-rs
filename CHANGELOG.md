@@ -8,9 +8,6 @@
   cell depends on the gene only through one scalar offset, so the first pass
   reads its sums from a table built once per run, and the second pass
   evaluates empty cells at 49 Chebyshev nodes in `ln T` and interpolates.
-  At 2000 genes by 20000 cells, `Marginalise` goes from 108 s to 13.2 s and
-  `PosteriorMean` from 72 s to 13.1 s. Output moves by at most `2e-8` of an
-  error bar.
 * Genes above 50% density keep the dense first pass; below that the sparse one
   wins. Metacell-style data is never slower than before.
 * The GPU first pass uses the same table for genes up to 50% dense. 1.5x to
