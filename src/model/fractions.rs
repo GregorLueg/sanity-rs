@@ -1,7 +1,9 @@
 //! The stationary point of the log posterior at a fixed variance.
 //!
 //! Everything here is per gene and dense in the cell axis: a cell with no
-//! counts for this gene still contributes through its library size.
+//! counts for this gene still contributes through its library size. The sparse
+//! sweep keeps that: it reads the empty cells' share from
+//! [`super::empty_cells::ShiftTable`] and sweeps only the nonzero cells.
 //!
 //! The stationarity condition is one Wright omega evaluation per cell plus a
 //! single scalar root find for the normalisation offset `z`. Writing
@@ -9,6 +11,7 @@
 //! `sum_c w_c = 1` becomes `sum_c omega(x_c) = v s`, which is strictly
 //! decreasing in `z` and so has a unique root.
 
+use super::empty_cells::{EmptySums, ShiftTable, direct_sums};
 use crate::errors::SanityErrors;
 use crate::utils::wright_omega::{log_omega, log_omega_near, omega_from_log};
 
@@ -217,11 +220,175 @@ fn evaluate(
     }
 }
 
+//////////////////
+// NonzeroCells //
+//////////////////
+
+/// A gene's nonzero cells, compacted, with their per-cell sweep state.
+///
+/// The sparse sweep needs two roots per cell: at the cell's own argument, and
+/// at the argument it would have with no counts, which is its term inside the
+/// table's all-cell sum and has to come back out. Both warm start like the
+/// dense sweep.
+#[derive(Clone, Debug)]
+pub(crate) struct NonzeroCells {
+    /// `k_c`.
+    counts: Vec<f64>,
+    /// `ln T_c`.
+    log_totals: Vec<f64>,
+    /// `omega(v k_c + ln T_c + shift)`.
+    omega: Vec<f64>,
+    /// `ln` of `omega`.
+    log_omega: Vec<f64>,
+    /// `omega(ln T_c + shift)`, the cell's term in the table.
+    omega_empty: Vec<f64>,
+    /// `ln` of `omega_empty`.
+    log_omega_empty: Vec<f64>,
+    /// What the four arrays hold, as for the dense [`SweepState`].
+    pub state: SweepState,
+}
+
+impl NonzeroCells {
+    /// Allocate for at most `n_cells` nonzero cells.
+    ///
+    /// ### Params
+    ///
+    /// * `n_cells` - Number of cells.
+    ///
+    /// ### Returns
+    ///
+    /// Empty scratch with capacity for every cell.
+    pub(crate) fn new(n_cells: usize) -> Self {
+        Self {
+            counts: Vec::with_capacity(n_cells),
+            log_totals: Vec::with_capacity(n_cells),
+            omega: Vec::with_capacity(n_cells),
+            log_omega: Vec::with_capacity(n_cells),
+            omega_empty: Vec::with_capacity(n_cells),
+            log_omega_empty: Vec::with_capacity(n_cells),
+            state: None,
+        }
+    }
+
+    /// Load one gene's nonzero cells and clear the sweep state.
+    ///
+    /// ### Params
+    ///
+    /// * `indices` - Cell indices of the stored counts.
+    /// * `values` - The stored counts.
+    /// * `log_totals` - `ln T_c` for every cell.
+    pub(crate) fn load(&mut self, indices: &[u32], values: &[u32], log_totals: &[f64]) {
+        self.counts.clear();
+        self.log_totals.clear();
+        for (&i, &k) in indices.iter().zip(values) {
+            if k > 0 {
+                self.counts.push(k as f64);
+                self.log_totals.push(log_totals[i as usize]);
+            }
+        }
+        let n = self.counts.len();
+        for a in [
+            &mut self.omega,
+            &mut self.log_omega,
+            &mut self.omega_empty,
+            &mut self.log_omega_empty,
+        ] {
+            a.clear();
+            a.resize(n, 0.0);
+        }
+        self.state = None;
+    }
+
+    /// One sweep, with the empty cells' share taken from the all-cell sums.
+    ///
+    /// The sums over the gene's empty cells are `all` minus the nonzero cells'
+    /// empty-argument terms, so each cell adds its own term and removes that
+    /// one.
+    ///
+    /// ### Params
+    ///
+    /// * `v` - The variance bin.
+    /// * `shift` - `ln(v s) - z`.
+    /// * `all` - The table's sums over every cell at `shift`.
+    ///
+    /// ### Returns
+    ///
+    /// Both reductions over all cells of the gene.
+    fn sweep(&mut self, v: f64, shift: f64, all: EmptySums) -> Sweep {
+        let (v_prev, shift_prev) = self.state.unwrap_or((0.0, 0.0));
+        let warm = self.state.is_some();
+        let dv = v - v_prev;
+        let dshift = shift - shift_prev;
+
+        let mut sum_omega = 0.0;
+        let mut curvature_sum = 0.0;
+        for c in 0..self.counts.len() {
+            let k = self.counts[c];
+            let lt = self.log_totals[c];
+
+            let x = v * k + lt + shift;
+            let t = if warm {
+                log_omega_near(x, dv * k + dshift, self.log_omega[c], self.omega[c])
+            } else {
+                log_omega(x)
+            };
+            let w = omega_from_log(x, t);
+
+            let x0 = lt + shift;
+            let t0 = if warm {
+                log_omega_near(x0, dshift, self.log_omega_empty[c], self.omega_empty[c])
+            } else {
+                log_omega(x0)
+            };
+            let w0 = omega_from_log(x0, t0);
+
+            self.log_omega[c] = t;
+            self.omega[c] = w;
+            self.log_omega_empty[c] = t0;
+            self.omega_empty[c] = w0;
+            sum_omega += w - w0;
+            curvature_sum += w / (1.0 + w) - w0 / (1.0 + w0);
+        }
+        self.state = Some((v, shift));
+
+        Sweep {
+            sum_omega: all.omega + sum_omega,
+            curvature_sum: all.curvature + curvature_sum,
+        }
+    }
+
+    /// The nonzero cells' share of the Laplace reductions.
+    ///
+    /// Each is the cell's own term minus its empty-argument term, so adding the
+    /// table's all-cell sum gives the reduction over every cell. An empty
+    /// cell's `d_c` is `-omega_c`, which is why `sum_c d_c^2` over the table is
+    /// `sum_c omega_c^2`.
+    ///
+    /// ### Params
+    ///
+    /// * `point` - The stationary point the arrays were last swept at.
+    ///
+    /// ### Returns
+    ///
+    /// `(sum d^2 - omega_0^2, sum k d, sum ln(1 + omega) - ln(1 + omega_0))`.
+    pub(crate) fn laplace_terms(&self, point: &Stationary) -> (f64, f64, f64) {
+        let mut sum_sq = 0.0;
+        let mut sum_data = 0.0;
+        let mut sum_log_diag = 0.0;
+        for c in 0..self.counts.len() {
+            let d = point.log_fold_change(self.log_omega[c], self.log_totals[c]);
+            let w0 = self.omega_empty[c];
+            sum_sq += d * d - w0 * w0;
+            sum_data += self.counts[c] * d;
+            sum_log_diag += self.omega[c].ln_1p() - w0.ln_1p();
+        }
+        (sum_sq, sum_data, sum_log_diag)
+    }
+}
+
 /// Solve the stationarity condition for one gene at one variance.
 ///
-/// SI eq. 27. Brackets the root of `F(z) = sum_c omega(x_c) - v s` by doubling,
-/// then runs Newton with the exact derivative `F'(z) = -sum_c omega_c / (1 + omega_c)`,
-/// falling back to bisection whenever a Newton step leaves the bracket.
+/// SI eq. 27, over the dense cell arrays. See [`solve_offset`] for the solve.
 ///
 /// ### Params
 ///
@@ -237,9 +404,7 @@ fn evaluate(
 ///
 /// ### Returns
 ///
-/// The stationary point, or [`SanityErrors::FractionSolveDiverged`] if neither
-/// the bracket nor the Newton loop settles. A root whose bracket has collapsed
-/// to a few ulp is returned regardless of the residual.
+/// The stationary point, or a solver failure.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn solve_stationary(
     v: f64,
@@ -251,17 +416,91 @@ pub(crate) fn solve_stationary(
     omega: &mut [f64],
     log_omega: &mut [f64],
 ) -> Result<Stationary, SanityErrors> {
+    let cold = state.is_none();
+    solve_offset(v, s, counts.len(), guess, cold, |log_vs, z| {
+        evaluate(v, log_vs, z, counts, log_totals, state, omega, log_omega)
+    })
+}
+
+/// Solve the stationarity condition, summing empty cells from the table.
+///
+/// SI eq. 27, with the reductions over cells with no counts taken from
+/// [`ShiftTable`] and only the gene's nonzero cells swept. Leaves the dense
+/// `omega` scratch untouched; a caller that needs per-cell values afterwards
+/// refreshes it.
+///
+/// ### Params
+///
+/// * `v` - The variance bin.
+/// * `s` - `K`, the total UMI count of this gene.
+/// * `n_cells` - Number of cells, for the residual tolerance.
+/// * `guess` - Starting offset.
+/// * `table` - The run's table of empty-cell sums.
+/// * `log_totals` - `ln T_c` for every cell, for the direct sum above the table.
+/// * `cells` - The gene's nonzero cells and their warm start state.
+///
+/// ### Returns
+///
+/// The stationary point, or a solver failure.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn solve_stationary_sparse(
+    v: f64,
+    s: f64,
+    n_cells: usize,
+    guess: f64,
+    table: &ShiftTable,
+    log_totals: &[f64],
+    cells: &mut NonzeroCells,
+) -> Result<Stationary, SanityErrors> {
+    let cold = cells.state.is_none();
+    solve_offset(v, s, n_cells, guess, cold, |log_vs, z| {
+        let shift = log_vs - z;
+        let all = table
+            .eval(shift)
+            .unwrap_or_else(|| direct_sums(log_totals, shift));
+        cells.sweep(v, shift, all)
+    })
+}
+
+/// The offset solve, over whatever sweep the caller supplies.
+///
+/// SI eq. 27. Brackets the root of `F(z) = sum_c omega(x_c) - v s` by doubling,
+/// then runs Newton with the exact derivative `F'(z) = -sum_c omega_c / (1 + omega_c)`,
+/// falling back to bisection whenever a Newton step leaves the bracket.
+///
+/// ### Params
+///
+/// * `v` - The variance bin.
+/// * `s` - `K`, the total UMI count of this gene.
+/// * `n_cells` - Number of cells, for the residual tolerance.
+/// * `guess` - Starting offset.
+/// * `cold` - Whether the sweep has no previous state to warm start from.
+/// * `sweep` - Takes `(ln(v s), z)` and returns both reductions at that `z`,
+///   leaving its per-cell state consistent with it.
+///
+/// ### Returns
+///
+/// The stationary point, or [`SanityErrors::FractionSolveDiverged`] if neither
+/// the bracket nor the Newton loop settles. A root whose bracket has collapsed
+/// to a few ulp is returned regardless of the residual.
+fn solve_offset(
+    v: f64,
+    s: f64,
+    n_cells: usize,
+    guess: f64,
+    cold: bool,
+    mut sweep: impl FnMut(f64, f64) -> Sweep,
+) -> Result<Stationary, SanityErrors> {
     let vs = v * s;
     let log_vs = vs.ln();
-    let tol = vs * OFFSET_TOL.max(OFFSET_SUM_ULPS * counts.len() as f64 * f64::EPSILON);
+    let tol = vs * OFFSET_TOL.max(OFFSET_SUM_ULPS * n_cells as f64 * f64::EPSILON);
 
-    // Every sweep leaves `omega`, `log_omega`, `f` and `fit.curvature_sum`
+    // Every sweep leaves its per-cell state, `f` and `fit.curvature_sum`
     // consistent with the `z` it was given, so no point is ever evaluated
     // twice: the bracket search hands its last sweep straight to Newton, and
     // the returned point's curvature is the one the final sweep accumulated.
     let mut z = guess;
-    let cold = state.is_none();
-    let mut fit = evaluate(v, log_vs, z, counts, log_totals, state, omega, log_omega);
+    let mut fit = sweep(log_vs, z);
     let mut f = fit.sum_omega - vs;
 
     // `F` is strictly decreasing in `z`, so a positive residual means `z` is too
@@ -281,7 +520,7 @@ pub(crate) fn solve_stationary(
             lo = hi - step;
             z = lo;
         }
-        fit = evaluate(v, log_vs, z, counts, log_totals, state, omega, log_omega);
+        fit = sweep(log_vs, z);
         f = fit.sum_omega - vs;
         if (ascending && f <= 0.0) || (!ascending && f >= 0.0) {
             break;
@@ -345,7 +584,7 @@ pub(crate) fn solve_stationary(
             });
         }
 
-        fit = evaluate(v, log_vs, z, counts, log_totals, state, omega, log_omega);
+        fit = sweep(log_vs, z);
         f = fit.sum_omega - vs;
     }
 

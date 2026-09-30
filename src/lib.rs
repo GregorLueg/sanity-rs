@@ -47,6 +47,7 @@ use crate::config::{SanityParams, VarianceGrid, VarianceRule};
 use crate::errors::SanityErrors;
 use crate::float::{SanityFloat, narrow};
 use crate::input::CountMatrix;
+use crate::model::empty_cells::ShiftTable;
 use crate::model::gene::{GeneScratch, GeneSummary, run_gene};
 use crate::utils::progress::report_decile_progress;
 
@@ -131,6 +132,7 @@ pub fn sanity<T: SanityFloat>(
     let n_cells = counts.n_cells();
     let n_genes = counts.n_genes();
     let (grid, log_totals, log_total_sum) = prepare_run(counts, cell_totals, &params)?;
+    let table = shift_table(counts, &log_totals, &params);
 
     let verbose = params.verbosity.normal_verbosity();
     if verbose {
@@ -171,6 +173,7 @@ pub fn sanity<T: SanityFloat>(
                     &log_totals,
                     log_total_sum,
                     &grid,
+                    table.as_ref(),
                     &params,
                     scratch,
                     row_d,
@@ -299,6 +302,34 @@ pub(crate) fn prepare_run(
     Ok((grid, log_totals, log_total_sum))
 }
 
+/// Build the table of empty-cell sums, if the rule sweeps a grid.
+///
+/// `VarianceRule::Fixed` solves once per gene, where the build would cost more
+/// than it saves.
+///
+/// ### Params
+///
+/// * `counts` - The count matrix, for the largest `K`.
+/// * `log_totals` - `ln T_c` for every cell.
+/// * `params` - Run parameters.
+///
+/// ### Returns
+///
+/// The table, or `None` for a rule without a grid.
+fn shift_table(
+    counts: &CountMatrix,
+    log_totals: &[f64],
+    params: &SanityParams,
+) -> Option<ShiftTable> {
+    if !params.variance_rule.needs_grid() {
+        return None;
+    }
+    let max_k = (0..counts.n_genes())
+        .map(|g| counts.gene(g).1.iter().map(|&k| k as f64).sum::<f64>())
+        .fold(0.0, f64::max);
+    Some(ShiftTable::new(log_totals, params.variance_max * max_k))
+}
+
 ////////////////////
 // Gene selection //
 ////////////////////
@@ -364,6 +395,7 @@ where
     let n_cells = counts.n_cells();
     let n_genes = counts.n_genes();
     let (grid, log_totals, log_total_sum) = prepare_run(counts, cell_totals, &params)?;
+    let table = shift_table(counts, &log_totals, &params);
 
     let verbose = params.verbosity.normal_verbosity();
     if verbose {
@@ -391,6 +423,7 @@ where
                     &log_totals,
                     log_total_sum,
                     &grid,
+                    table.as_ref(),
                     &params,
                     scratch,
                     row_d,

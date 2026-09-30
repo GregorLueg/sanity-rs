@@ -92,19 +92,6 @@ pub(crate) struct EmptySums {
 }
 
 impl EmptySums {
-    /// Add one cell's terms.
-    ///
-    /// ### Params
-    ///
-    /// * `w` - `omega(x_c)` for the cell.
-    #[inline(always)]
-    pub(crate) fn add(&mut self, w: f64) {
-        self.omega += w;
-        self.curvature += w / (1.0 + w);
-        self.omega_sq += w * w;
-        self.log_diag += w.ln_1p();
-    }
-
     /// The sums in a fixed order, for the table.
     ///
     /// ### Returns
@@ -223,9 +210,9 @@ impl ShiftTable {
                 .collect();
             pending = Vec::new();
             for (a, b, depth, (anchor, coeffs)) in fitted {
-                let converged = coeffs.chunks_exact(PANEL_POINTS).all(|c| {
-                    c[PANEL_DEGREE - 1].abs().max(c[PANEL_DEGREE].abs()) <= PANEL_TOL
-                });
+                let converged = coeffs
+                    .chunks_exact(PANEL_POINTS)
+                    .all(|c| c[PANEL_DEGREE - 1].abs().max(c[PANEL_DEGREE].abs()) <= PANEL_TOL);
                 if converged || depth >= PANEL_MAX_DEPTH {
                     done.push((a, b, anchor, coeffs));
                 } else {
@@ -347,7 +334,11 @@ fn fit_panel(log_totals: &[f64], a: f64, b: f64) -> ([f64; N_SUMS], Vec<f64>) {
         for k in 0..PANEL_POINTS {
             let mut c = 0.0;
             for (j, &yj) in y.iter().enumerate() {
-                let half = if j == 0 || j == PANEL_DEGREE { 0.5 } else { 1.0 };
+                let half = if j == 0 || j == PANEL_DEGREE {
+                    0.5
+                } else {
+                    1.0
+                };
                 c += half * yj * (std::f64::consts::PI * (j * k) as f64 / n).cos();
             }
             c *= 2.0 / n;

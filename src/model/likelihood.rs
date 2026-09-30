@@ -11,7 +11,8 @@
 //! `v s w_c = omega_c`, so `s w_c + 1/v = (1 + omega_c) / v`. Everything below
 //! is therefore a single fused pass over `omega`.
 
-use super::fractions::Stationary;
+use super::empty_cells::{ShiftTable, direct_sums};
+use super::fractions::{NonzeroCells, Stationary};
 
 /////////////
 // Laplace //
@@ -52,10 +53,6 @@ pub(crate) fn laplace(
     omega: &[f64],
     log_omega: &[f64],
 ) -> Laplace {
-    let n_cells = counts.len() as f64;
-    let v = point.v;
-    let curvature_sum = point.curvature_sum;
-
     let mut sum_sq = 0.0;
     let mut sum_data = 0.0;
     let mut sum_log_diag = 0.0;
@@ -67,12 +64,76 @@ pub(crate) fn laplace(
         sum_log_diag += w.ln_1p();
     }
 
+    combine(point, counts.len(), sum_sq, sum_data, sum_log_diag)
+}
+
+/// Evaluate the marginal likelihood from the nonzero cells and the table.
+///
+/// Same reductions as [`laplace`], with the empty cells' share of each read
+/// from the table at the point's `shift`.
+///
+/// ### Params
+///
+/// * `point` - The stationary point, as returned by
+///   [`super::fractions::solve_stationary_sparse`].
+/// * `n_cells` - Number of cells.
+/// * `table` - The run's table of empty-cell sums.
+/// * `log_totals` - `ln T_c` for every cell, for the direct sum above the table.
+/// * `cells` - The gene's nonzero cells, last swept at `point`.
+///
+/// ### Returns
+///
+/// The log marginal likelihood.
+pub(crate) fn laplace_sparse(
+    point: &Stationary,
+    n_cells: usize,
+    table: &ShiftTable,
+    log_totals: &[f64],
+    cells: &NonzeroCells,
+) -> Laplace {
+    let shift = point.log_vs - point.z;
+    let all = table
+        .eval(shift)
+        .unwrap_or_else(|| direct_sums(log_totals, shift));
+    let (sum_sq, sum_data, sum_log_diag) = cells.laplace_terms(point);
+    combine(
+        point,
+        n_cells,
+        all.omega_sq + sum_sq,
+        sum_data,
+        all.log_diag + sum_log_diag,
+    )
+}
+
+/// Assemble the log marginal likelihood from its three cell reductions.
+///
+/// ### Params
+///
+/// * `point` - The stationary point.
+/// * `n_cells` - Number of cells.
+/// * `sum_sq` - `sum_c d_c^2`.
+/// * `sum_data` - `sum_c k_c d_c`.
+/// * `sum_log_diag` - `sum_c ln(1 + omega_c)`.
+///
+/// ### Returns
+///
+/// The log marginal likelihood.
+fn combine(
+    point: &Stationary,
+    n_cells: usize,
+    sum_sq: f64,
+    sum_data: f64,
+    sum_log_diag: f64,
+) -> Laplace {
+    let n_cells = n_cells as f64;
+    let v = point.v;
+
     // SI eq. 20 at the optimum, using sum_c T_c exp(d*_c) = exp(z).
     let log_star = -0.5 * n_cells * v.ln() - 0.5 * sum_sq / v + sum_data - point.s * point.z;
 
     // SI eq. 33, in the cancellation-free form. The diagonal contributes
     // sum_c ln((1 + omega_c) / v); the rank-one term contributes ln(S_A / (v s)).
-    let log_det = curvature_sum.ln() - point.log_vs + sum_log_diag - n_cells * v.ln();
+    let log_det = point.curvature_sum.ln() - point.log_vs + sum_log_diag - n_cells * v.ln();
 
     Laplace {
         log_marginal: log_star - 0.5 * log_det,
@@ -198,6 +259,77 @@ mod tests {
                 let mut perturbed = d.clone();
                 perturbed[c] += step;
                 assert!(objective(&perturbed) < best);
+            }
+        }
+    }
+
+    #[test]
+    fn test_sparse_sweep_matches_dense() {
+        use super::super::fractions::solve_stationary_sparse;
+        use crate::simulate::{SimulationParams, simulate};
+
+        let sim = simulate(Some(SimulationParams {
+            n_genes: 20,
+            n_cells: 500,
+            library_size: 200.0,
+            ..SimulationParams::default()
+        }))
+        .expect("valid simulation");
+        let n_cells = sim.cell_totals.len();
+        let log_totals: Vec<f64> = sim.cell_totals.iter().map(|t| t.ln()).collect();
+        let log_total_sum = sim.cell_totals.iter().sum::<f64>().ln();
+        let table = ShiftTable::new(&log_totals, 50.0 * 1e5);
+
+        let mut cells = NonzeroCells::new(n_cells);
+        let mut counts = vec![0.0; n_cells];
+        let mut omega = vec![0.0; n_cells];
+        let mut log_omega = vec![0.0; n_cells];
+        for g in 0..sim.counts.n_genes() {
+            let (indices, values) = sim.counts.gene(g);
+            if values.is_empty() {
+                continue;
+            }
+            counts.fill(0.0);
+            for (&i, &k) in indices.iter().zip(values) {
+                counts[i as usize] = k as f64;
+            }
+            let s: f64 = counts.iter().sum();
+            cells.load(indices, values, &log_totals);
+
+            for &v in &[1e-3, 0.1, 1.0, 10.0, 50.0] {
+                let guess = log_total_sum + 0.5 * v;
+                let dense = solve_stationary(
+                    v,
+                    s,
+                    &counts,
+                    &log_totals,
+                    guess,
+                    &mut None,
+                    &mut omega,
+                    &mut log_omega,
+                )
+                .expect("converges");
+                // Cold, like the dense solve above: the warm start is built
+                // for neighbouring grid bins, not jumps of this size.
+                cells.state = None;
+                let sparse =
+                    solve_stationary_sparse(v, s, n_cells, guess, &table, &log_totals, &mut cells)
+                        .expect("converges");
+
+                assert_relative_eq!(sparse.z, dense.z, epsilon = 1e-11);
+                assert_relative_eq!(
+                    sparse.curvature_sum,
+                    dense.curvature_sum,
+                    max_relative = 1e-10
+                );
+                let want = laplace(&dense, &counts, &log_totals, &omega, &log_omega);
+                let got = laplace_sparse(&sparse, n_cells, &table, &log_totals, &cells);
+                assert_relative_eq!(
+                    got.log_marginal,
+                    want.log_marginal,
+                    epsilon = 1e-8,
+                    max_relative = 1e-12
+                );
             }
         }
     }

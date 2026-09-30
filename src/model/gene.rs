@@ -15,8 +15,11 @@
 //! solves, not by memory traffic, so the tiling bought nothing and the extra
 //! indexing cost.
 
-use super::fractions::{Stationary, SweepState, refresh, solve_stationary};
-use super::likelihood::laplace;
+use super::empty_cells::ShiftTable;
+use super::fractions::{
+    NonzeroCells, Stationary, SweepState, refresh, solve_stationary, solve_stationary_sparse,
+};
+use super::likelihood::{laplace, laplace_sparse};
 use super::variance::cell_variance;
 use crate::config::{SanityParams, VarianceGrid, VarianceRule};
 use crate::errors::SanityErrors;
@@ -47,6 +50,19 @@ use crate::utils::polygamma::{digamma, trigamma};
 /// divide a zero weight by a zero running sum.
 pub(crate) const MARGINALISE_MIN_WEIGHT: f64 = 1e-10;
 
+/// Fraction of cells with counts above which a gene sweeps densely.
+///
+/// The sparse sweep solves two roots per nonzero cell against one per cell for
+/// the dense sweep. The empty-argument root sits at small `x` and converges in
+/// fewer iterations, which is why the crossover lands at one half rather than
+/// below it.
+///
+/// Measured 2026-09-30 on an M1 Max, `PosteriorMean`, 400 simulated genes over
+/// 4000 cells, two interleaved passes. At 40.6% overall density: 1.93 s at
+/// `0.4`, 1.87 s here, 1.87 s at `0.6`, 1.93 s at `0.7`, 2.09 s at `0.3`, 2.36 s
+/// with no gate. At 59.8%: 2.45 s, 2.41 s, 2.40 s, 2.46 s, 2.57 s and 3.36 s.
+const SPARSE_MAX_DENSITY: f64 = 0.5;
+
 /////////////////
 // GeneScratch //
 /////////////////
@@ -76,6 +92,8 @@ pub(crate) struct GeneScratch {
     curvature: Vec<f64>,
     /// Posterior weights `W_b`, length `n_bins`.
     weights: Vec<f64>,
+    /// The gene's nonzero cells, for the sparse first pass.
+    nonzero: NonzeroCells,
     /// What `omega` and `log_omega` currently hold, for warm starting.
     ///
     /// Cleared at the start of every gene: the arrays survive across genes but
@@ -106,6 +124,7 @@ impl GeneScratch {
             offsets: vec![0.0; n_bins],
             curvature: vec![0.0; n_bins],
             weights: vec![0.0; n_bins],
+            nonzero: NonzeroCells::new(n_cells),
             state: None,
         }
     }
@@ -130,6 +149,9 @@ impl GeneScratch {
 /// * `log_totals` - `ln T_c` for every cell.
 /// * `log_total_sum` - `ln(sum_c T_c)`.
 /// * `grid` - The variance grid.
+/// * `table` - The run's empty-cell sums, or `None` to sweep every cell. With
+///   it, only `scratch.nonzero` is swept and the dense `omega` scratch is left
+///   untouched.
 /// * `scratch` - Per-thread scratch; `log_lik`, `offsets` and `curvature` are
 ///   filled.
 ///
@@ -141,27 +163,47 @@ fn sweep_grid(
     log_totals: &[f64],
     log_total_sum: f64,
     grid: &VarianceGrid,
+    table: Option<&ShiftTable>,
     scratch: &mut GeneScratch,
 ) -> Result<(), SanityErrors> {
+    let n_cells = log_totals.len();
     let mut guess = log_total_sum + 0.5 * grid.values[0];
     for (b, &v) in grid.values.iter().enumerate() {
-        let point = solve_stationary(
-            v,
-            s,
-            &scratch.counts,
-            log_totals,
-            guess,
-            &mut scratch.state,
-            &mut scratch.omega,
-            &mut scratch.log_omega,
-        )?;
-        let fit = laplace(
-            &point,
-            &scratch.counts,
-            log_totals,
-            &scratch.omega,
-            &scratch.log_omega,
-        );
+        let (point, fit) = match table {
+            Some(table) => {
+                let point = solve_stationary_sparse(
+                    v,
+                    s,
+                    n_cells,
+                    guess,
+                    table,
+                    log_totals,
+                    &mut scratch.nonzero,
+                )?;
+                let fit = laplace_sparse(&point, n_cells, table, log_totals, &scratch.nonzero);
+                (point, fit)
+            }
+            None => {
+                let point = solve_stationary(
+                    v,
+                    s,
+                    &scratch.counts,
+                    log_totals,
+                    guess,
+                    &mut scratch.state,
+                    &mut scratch.omega,
+                    &mut scratch.log_omega,
+                )?;
+                let fit = laplace(
+                    &point,
+                    &scratch.counts,
+                    log_totals,
+                    &scratch.omega,
+                    &scratch.log_omega,
+                );
+                (point, fit)
+            }
+        };
         scratch.log_lik[b] = fit.log_marginal;
         scratch.offsets[b] = point.z;
         scratch.curvature[b] = point.curvature_sum;
@@ -541,6 +583,8 @@ pub(crate) struct GeneSummary {
 /// * `log_totals` - `ln T_c` for every cell, length `n_cells`.
 /// * `log_total_sum` - `ln(sum_c T_c)`, the seed for the first offset solve.
 /// * `grid` - The variance grid.
+/// * `table` - The run's empty-cell sums, if built. Used for the first pass
+///   when the gene is at most [`SPARSE_MAX_DENSITY`] dense.
 /// * `params` - Run parameters.
 /// * `scratch` - Per-thread scratch.
 /// * `out_fold_change` - Output, `d_c` for every cell.
@@ -556,6 +600,7 @@ pub(crate) fn run_gene(
     log_totals: &[f64],
     log_total_sum: f64,
     grid: &VarianceGrid,
+    table: Option<&ShiftTable>,
     params: &SanityParams,
     scratch: &mut GeneScratch,
     out_fold_change: &mut [f64],
@@ -603,7 +648,12 @@ pub(crate) fn run_gene(
             }
         }
         rule => {
-            sweep_grid(s, log_totals, log_total_sum, grid, scratch)?;
+            let table =
+                table.filter(|_| indices.len() as f64 <= SPARSE_MAX_DENSITY * n_cells as f64);
+            if table.is_some() {
+                scratch.nonzero.load(indices, values, log_totals);
+            }
+            sweep_grid(s, log_totals, log_total_sum, grid, table, scratch)?;
             posterior_weights(&scratch.log_lik, &mut scratch.weights)?;
             match rule {
                 VarianceRule::Marginalise => marginalise(
