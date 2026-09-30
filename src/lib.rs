@@ -318,7 +318,7 @@ pub(crate) fn prepare_run(
 /// ### Returns
 ///
 /// The table, or `None` for a rule without a grid.
-fn shift_table(
+pub(crate) fn shift_table(
     counts: &CountMatrix,
     log_totals: &[f64],
     params: &SanityParams,

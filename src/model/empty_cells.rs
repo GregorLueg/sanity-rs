@@ -38,10 +38,10 @@ use crate::utils::wright_omega::{log_omega, omega_from_log};
 const PANEL_DEGREE: usize = 16;
 
 /// Points per panel.
-const PANEL_POINTS: usize = PANEL_DEGREE + 1;
+pub(crate) const PANEL_POINTS: usize = PANEL_DEGREE + 1;
 
 /// Number of interpolated sums.
-const N_SUMS: usize = 4;
+pub(crate) const N_SUMS: usize = 4;
 
 /// Largest tolerated trailing Chebyshev coefficient of `ln(G_f / G_f(mid))`.
 ///
@@ -103,28 +103,54 @@ impl EmptySums {
     }
 }
 
+/// The run's distinct `ln T_c`, each with the number of cells that have it.
+///
+/// Every sum here depends on a cell only through its total, and totals are
+/// UMI counts, so a run holds far fewer distinct values than cells: the table
+/// build sums over these, exactly, instead of over the cells.
+///
+/// ### Params
+///
+/// * `log_totals` - `ln T_c` for every cell.
+///
+/// ### Returns
+///
+/// `(ln T, multiplicity)` pairs, ascending in `ln T`.
+fn distinct_totals(log_totals: &[f64]) -> Vec<(f64, f64)> {
+    let mut sorted = log_totals.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let mut out: Vec<(f64, f64)> = Vec::new();
+    for lt in sorted {
+        match out.last_mut() {
+            Some((last, m)) if *last == lt => *m += 1.0,
+            _ => out.push((lt, 1.0)),
+        }
+    }
+    out
+}
+
 /// The four sums over every cell at one `shift`, by compensated summation.
 ///
 /// Neumaier summation, so the node values the table is fitted to carry a few
 /// ulp of error whatever the cell count. Naive summation leaves noise growing
 /// as `sqrt(C) eps`, which the Chebyshev tail then cannot get under
-/// [`PANEL_TOL`]. Build time only, so the extra adds cost nothing that matters.
+/// [`PANEL_TOL`].
 ///
 /// ### Params
 ///
-/// * `log_totals` - `ln T_c` of the cells to sum over.
+/// * `totals` - `(ln T, multiplicity)` pairs from [`distinct_totals`].
 /// * `shift` - `ln(v s) - z`.
 ///
 /// ### Returns
 ///
-/// The sums, `O(n_cells)` Wright omega solves.
-pub(crate) fn direct_sums(log_totals: &[f64], shift: f64) -> EmptySums {
+/// The sums, one Wright omega solve per distinct total.
+fn direct_sums(totals: &[(f64, f64)], shift: f64) -> EmptySums {
     let mut sum = [0.0; N_SUMS];
     let mut comp = [0.0; N_SUMS];
-    for &lt in log_totals {
+    for &(lt, m) in totals {
         let x = lt + shift;
         let w = omega_from_log(x, log_omega(x));
-        let terms = [w, w / (1.0 + w), w * w, w.ln_1p()];
+        let terms = [m * w, m * w / (1.0 + w), m * w * w, m * w.ln_1p()];
         for f in 0..N_SUMS {
             let t = sum[f] + terms[f];
             comp[f] += if sum[f].abs() >= terms[f].abs() {
@@ -163,6 +189,9 @@ pub(crate) struct ShiftTable {
     log_total_sum: f64,
     /// `ln(sum_c T_c^2)`, for the asymptotic branch.
     log_total_sq_sum: f64,
+    /// Distinct `ln T_c` with multiplicities, for the direct sum above the
+    /// table.
+    totals: Vec<(f64, f64)>,
 }
 
 impl ShiftTable {
@@ -175,7 +204,11 @@ impl ShiftTable {
     /// root, so no root of the run sits above it.
     ///
     /// Panels are split in half until every sum's Chebyshev tail is below
-    /// [`PANEL_TOL`]. Node sums run in parallel.
+    /// [`PANEL_TOL`]. Node sums run in parallel, over the distinct totals.
+    ///
+    /// Summing over distinct totals rather than cells measured 2026-09-30 on
+    /// an M1 Max: at 200000 simulated cells the build was 0.94 s over cells,
+    /// about 1.4 s of a 3.5 s GPU run, which erased that path's gain.
     ///
     /// ### Params
     ///
@@ -186,6 +219,7 @@ impl ShiftTable {
     ///
     /// The table.
     pub(crate) fn new(log_totals: &[f64], max_vs: f64) -> Self {
+        let totals = distinct_totals(log_totals);
         let max_lt = log_totals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let log_total_sum = log_totals.iter().map(|lt| lt.exp()).sum::<f64>().ln();
         let log_total_sq_sum = log_totals
@@ -197,7 +231,7 @@ impl ShiftTable {
         let lower = -ASYMPTOTE_DEPTH - max_lt;
         let target = UPPER_HEADROOM * max_vs;
         let mut width = 1.0;
-        while direct_sums(log_totals, lower + width).omega < target {
+        while direct_sums(&totals, lower + width).omega < target {
             width *= 2.0;
         }
         let upper = lower + width;
@@ -207,7 +241,7 @@ impl ShiftTable {
         while !pending.is_empty() {
             let fitted: Vec<_> = pending
                 .par_iter()
-                .map(|&(a, b, depth)| (a, b, depth, fit_panel(log_totals, a, b)))
+                .map(|&(a, b, depth)| (a, b, depth, fit_panel(&totals, a, b)))
                 .collect();
             pending = Vec::new();
             for (a, b, depth, (anchor, coeffs)) in fitted {
@@ -241,7 +275,25 @@ impl ShiftTable {
             coeffs,
             log_total_sum,
             log_total_sq_sum,
+            totals,
         }
+    }
+
+    /// The table narrowed to `f32`, in the layout the device kernel reads.
+    ///
+    /// ### Returns
+    ///
+    /// Panel boundaries, midpoint anchors, coefficients, then
+    /// `[ln(sum_c T_c), ln(sum_c T_c^2)]`, each in the layout of the fields.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn to_f32(&self) -> [Vec<f32>; 4] {
+        let narrow = |x: &[f64]| x.iter().map(|&v| v as f32).collect();
+        [
+            narrow(&self.breaks),
+            narrow(&self.anchors),
+            narrow(&self.coeffs),
+            vec![self.log_total_sum as f32, self.log_total_sq_sum as f32],
+        ]
     }
 
     /// Lowest and highest `shift` the table covers.
@@ -262,22 +314,23 @@ impl ShiftTable {
     ///
     /// ### Returns
     ///
-    /// The sums, or `None` above the table, where the caller must sum directly.
+    /// The sums. Above the table, which no root reaches, by direct summation
+    /// over the distinct totals.
     #[inline]
-    pub(crate) fn eval(&self, shift: f64) -> Option<EmptySums> {
+    pub(crate) fn eval(&self, shift: f64) -> EmptySums {
         let lower = self.breaks[0];
         if shift < lower {
             let omega = (shift + self.log_total_sum).exp();
-            return Some(EmptySums {
+            return EmptySums {
                 omega,
                 curvature: omega,
                 omega_sq: (2.0 * shift + self.log_total_sq_sum).exp(),
                 log_diag: omega,
-            });
+            };
         }
         let n_panels = self.breaks.len() - 1;
         if shift > self.breaks[n_panels] || shift.is_nan() {
-            return None;
+            return direct_sums(&self.totals, shift);
         }
         let p = (self.breaks.partition_point(|&b| b <= shift) - 1).min(n_panels - 1);
         let (a, b) = (self.breaks[p], self.breaks[p + 1]);
@@ -289,12 +342,12 @@ impl ShiftTable {
             let c = &self.coeffs[base + f * PANEL_POINTS..base + (f + 1) * PANEL_POINTS];
             *out = self.anchors[p * N_SUMS + f] * clenshaw(c, t).exp();
         }
-        Some(EmptySums {
+        EmptySums {
             omega: g[0],
             curvature: g[1],
             omega_sq: g[2],
             log_diag: g[3],
-        })
+        }
     }
 }
 
@@ -311,18 +364,18 @@ impl ShiftTable {
 ///
 /// ### Params
 ///
-/// * `log_totals` - `ln T_c` for every cell.
+/// * `totals` - `(ln T, multiplicity)` pairs from [`distinct_totals`].
 /// * `a` - Panel start.
 /// * `b` - Panel end.
 ///
 /// ### Returns
 ///
 /// The four midpoint anchors and the coefficients, `[f * PANEL_POINTS + k]`.
-fn fit_panel(log_totals: &[f64], a: f64, b: f64) -> ([f64; N_SUMS], Vec<f64>) {
+fn fit_panel(totals: &[(f64, f64)], a: f64, b: f64) -> ([f64; N_SUMS], Vec<f64>) {
     let cheb = Chebyshev::new(a, b, PANEL_DEGREE);
     let nodes: Vec<[f64; N_SUMS]> = (0..PANEL_POINTS)
         .into_par_iter()
-        .map(|j| direct_sums(log_totals, cheb.node(j)).to_array())
+        .map(|j| direct_sums(totals, cheb.node(j)).to_array())
         .collect();
     let anchor = nodes[PANEL_DEGREE / 2];
 
@@ -365,8 +418,9 @@ mod tests {
             // Irrational stride so no sample lands on a node.
             let u = (i as f64 * 0.618_033_988_749_895).fract();
             let shift = lo + (hi - lo) * u;
-            let got = table.eval(shift).expect("inside the table").to_array();
-            let want = direct_sums(lt, shift).to_array();
+            let got = table.eval(shift).to_array();
+            let want =
+                direct_sums(&lt.iter().map(|&x| (x, 1.0)).collect::<Vec<_>>(), shift).to_array();
             for f in 0..N_SUMS {
                 worst[f] = worst[f].max(((got[f] - want[f]) / want[f]).abs());
             }
@@ -386,11 +440,15 @@ mod tests {
     }
 
     #[test]
-    fn test_shift_table_is_none_above_its_domain() {
+    fn test_shift_table_sums_directly_above_its_domain() {
         let lt = log_totals(500, 500.0);
         let table = ShiftTable::new(&lt, 1e3);
         let (_, hi) = table.domain();
-        assert!(table.eval(hi + 1.0).is_none());
-        assert!(table.eval(hi - 1e-9).is_some());
+        let cells: Vec<(f64, f64)> = lt.iter().map(|&x| (x, 1.0)).collect();
+        let got = table.eval(hi + 1.0).to_array();
+        let want = direct_sums(&cells, hi + 1.0).to_array();
+        for f in 0..N_SUMS {
+            assert!(((got[f] - want[f]) / want[f]).abs() < 1e-13, "sum {f}");
+        }
     }
 }

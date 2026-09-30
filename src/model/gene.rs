@@ -70,7 +70,7 @@ pub(crate) const MARGINALISE_MIN_WEIGHT: f64 = 1e-10;
 /// 4000 cells, two interleaved passes. At 40.6% overall density: 1.93 s at
 /// `0.4`, 1.87 s here, 1.87 s at `0.6`, 1.93 s at `0.7`, 2.09 s at `0.3`, 2.36 s
 /// with no gate. At 59.8%: 2.45 s, 2.41 s, 2.40 s, 2.46 s, 2.57 s and 3.36 s.
-const SPARSE_MAX_DENSITY: f64 = 0.5;
+pub(crate) const SPARSE_MAX_DENSITY: f64 = 0.5;
 
 /// Chebyshev degree of the fit that fills in the empty cells.
 ///
@@ -214,16 +214,9 @@ fn sweep_grid(
     for (b, &v) in grid.values.iter().enumerate() {
         let (point, fit) = match table {
             Some(table) => {
-                let point = solve_stationary_sparse(
-                    v,
-                    s,
-                    n_cells,
-                    guess,
-                    table,
-                    log_totals,
-                    &mut scratch.nonzero,
-                )?;
-                let fit = laplace_sparse(&point, n_cells, table, log_totals, &scratch.nonzero);
+                let point =
+                    solve_stationary_sparse(v, s, n_cells, guess, table, &mut scratch.nonzero)?;
+                let fit = laplace_sparse(&point, n_cells, table, &scratch.nonzero);
                 (point, fit)
             }
             None => {
@@ -655,15 +648,7 @@ fn collapse(
             // Cold per-cell state: the last sweep sat at the top of the grid,
             // far from `v`, so a warm prediction would start far off.
             scratch.nonzero.state = None;
-            solve_stationary_sparse(
-                v,
-                s,
-                log_totals.len(),
-                guess,
-                table,
-                log_totals,
-                &mut scratch.nonzero,
-            )?
+            solve_stationary_sparse(v, s, log_totals.len(), guess, table, &mut scratch.nonzero)?
         }
         None => solve_stationary(
             v,
@@ -783,6 +768,39 @@ pub(crate) fn log_marginal_at(
 ) -> Result<(f64, f64), SanityErrors> {
     let point = solve_stationary(v, s, counts, log_totals, guess, state, omega, log_omega)?;
     let fit = laplace(&point, counts, log_totals, omega, log_omega);
+    Ok((fit.log_marginal, point.z))
+}
+
+/// [`log_marginal_at`] with the empty cells summed from the table.
+///
+/// One sparse offset solve and one sparse Laplace fit. The GPU path calls this
+/// for the bins of a table gene its own `f32` likelihood cannot separate.
+///
+/// ### Params
+///
+/// * `v` - The variance.
+/// * `s` - `K`, the total UMI count of this gene.
+/// * `guess` - Starting offset.
+/// * `table` - The run's table of empty-cell sums.
+/// * `log_totals` - `ln T_c` for every cell.
+/// * `cells` - The gene's nonzero cells, loaded; their state carries a warm
+///   start from one call to the next.
+///
+/// ### Returns
+///
+/// `ln P(k | v)` and the offset `z(v)`, or a solver failure.
+#[cfg(feature = "gpu")]
+pub(crate) fn log_marginal_at_sparse(
+    v: f64,
+    s: f64,
+    guess: f64,
+    table: &ShiftTable,
+    log_totals: &[f64],
+    cells: &mut NonzeroCells,
+) -> Result<(f64, f64), SanityErrors> {
+    let n_cells = log_totals.len();
+    let point = solve_stationary_sparse(v, s, n_cells, guess, table, cells)?;
+    let fit = laplace_sparse(&point, n_cells, table, cells);
     Ok((fit.log_marginal, point.z))
 }
 

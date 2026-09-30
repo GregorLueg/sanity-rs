@@ -11,7 +11,7 @@
 //! `v s w_c = omega_c`, so `s w_c + 1/v = (1 + omega_c) / v`. Everything below
 //! is therefore a single fused pass over `omega`.
 
-use super::empty_cells::{ShiftTable, direct_sums};
+use super::empty_cells::ShiftTable;
 use super::fractions::{NonzeroCells, Stationary};
 
 /////////////
@@ -78,7 +78,6 @@ pub(crate) fn laplace(
 ///   [`super::fractions::solve_stationary_sparse`].
 /// * `n_cells` - Number of cells.
 /// * `table` - The run's table of empty-cell sums.
-/// * `log_totals` - `ln T_c` for every cell, for the direct sum above the table.
 /// * `cells` - The gene's nonzero cells, last swept at `point`.
 ///
 /// ### Returns
@@ -88,13 +87,10 @@ pub(crate) fn laplace_sparse(
     point: &Stationary,
     n_cells: usize,
     table: &ShiftTable,
-    log_totals: &[f64],
     cells: &NonzeroCells,
 ) -> Laplace {
     let shift = point.log_vs - point.z;
-    let all = table
-        .eval(shift)
-        .unwrap_or_else(|| direct_sums(log_totals, shift));
+    let all = table.eval(shift);
     let (sum_sq, sum_data, sum_log_diag) = cells.laplace_terms(point);
     combine(
         point,
@@ -311,9 +307,8 @@ mod tests {
                 .expect("converges");
                 // Warm across jumps far larger than a grid step, which is
                 // what `log_omega_near`'s cold restart is for.
-                let sparse =
-                    solve_stationary_sparse(v, s, n_cells, guess, &table, &log_totals, &mut cells)
-                        .expect("converges");
+                let sparse = solve_stationary_sparse(v, s, n_cells, guess, &table, &mut cells)
+                    .expect("converges");
 
                 // Both solves stop anywhere inside the residual tolerance, a
                 // band `tol / S_A` wide in `z`; this mirrors `solve_offset`'s
@@ -332,7 +327,7 @@ mod tests {
                     max_relative = 1e-10
                 );
                 let want = laplace(&dense, &counts, &log_totals, &omega, &log_omega);
-                let got = laplace_sparse(&sparse, n_cells, &table, &log_totals, &cells);
+                let got = laplace_sparse(&sparse, n_cells, &table, &cells);
                 assert_relative_eq!(
                     got.log_marginal,
                     want.log_marginal,

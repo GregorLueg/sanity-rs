@@ -11,7 +11,7 @@
 //! `sum_c w_c = 1` becomes `sum_c omega(x_c) = v s`, which is strictly
 //! decreasing in `z` and so has a unique root.
 
-use super::empty_cells::{EmptySums, ShiftTable, direct_sums};
+use super::empty_cells::{EmptySums, ShiftTable};
 use crate::errors::SanityErrors;
 use crate::utils::wright_omega::{log_omega, log_omega_near, omega_from_log};
 
@@ -436,7 +436,6 @@ pub(crate) fn solve_stationary(
 /// * `n_cells` - Number of cells, for the residual tolerance.
 /// * `guess` - Starting offset.
 /// * `table` - The run's table of empty-cell sums.
-/// * `log_totals` - `ln T_c` for every cell, for the direct sum above the table.
 /// * `cells` - The gene's nonzero cells and their warm start state.
 ///
 /// ### Returns
@@ -449,15 +448,12 @@ pub(crate) fn solve_stationary_sparse(
     n_cells: usize,
     guess: f64,
     table: &ShiftTable,
-    log_totals: &[f64],
     cells: &mut NonzeroCells,
 ) -> Result<Stationary, SanityErrors> {
     let cold = cells.state.is_none();
     solve_offset(v, s, n_cells, guess, cold, |log_vs, z| {
         let shift = log_vs - z;
-        let all = table
-            .eval(shift)
-            .unwrap_or_else(|| direct_sums(log_totals, shift));
+        let all = table.eval(shift);
         cells.sweep(v, shift, all)
     })
 }
