@@ -11,11 +11,11 @@ good to 10 to 20%.
 ## Against the reference binary
 
 Black-box comparison with the reference Sanity binary (v2.0.0, built from
-`jmbreda/Sanity`), under the terms in `docs/PROVENANCE.md`. The harness lives
-outside this repository at `~/repos/others/sanity-comparison`. Both read the
-same Matrix Market file and write text output. Run: `Marginalise` /
-`-v_m MARG`, 160 bins over `[1e-3, 50]`. Wall time and peak RSS are for the
-whole process, from `/usr/bin/time -l`.
+`jmbreda/Sanity`), under the terms in `docs/PROVENANCE.md`. The harness is
+private and lives outside this repository. Both read the same Matrix Market
+file and write text output. Run: `Marginalise` / `-v_m MARG`, 160 bins over
+`[1e-3, 50]`. Wall time and peak RSS are for the whole process, from
+`/usr/bin/time -l`.
 
 The reference timings are from 2026-09-24, same machine; the binary has not
 changed since. Ours are from 2026-09-30.
