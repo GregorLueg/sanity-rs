@@ -18,10 +18,9 @@
 //! total. What is swept per bin is the gene's nonzero cells plus the nodes.
 //!
 //! Running the second pass cell block outermost instead, so that a block stays
-//! in L1 across the whole grid, was measured on 2026-09-13 and was 10% slower:
-//! the pass is bound by the transcendentals in the Wright omega and error bar
-//! solves, not by memory traffic, so the tiling bought nothing and the extra
-//! indexing cost.
+//! in L1 across the whole grid, was measured slower: the pass is bound by the
+//! transcendentals in the Wright omega and error bar solves, not by memory
+//! traffic, so the tiling bought nothing and the extra indexing cost.
 
 use super::empty_cells::ShiftTable;
 use super::fractions::{
@@ -46,13 +45,10 @@ use crate::utils::polygamma::{digamma, trigamma};
 /// costs a full sweep over the cells plus an error bar solve in each of them,
 /// which is the whole cost of the rule.
 ///
-/// Measured 2026-09-13 on an M1 Max, 161 bins. On 400 simulated genes over
-/// 4000 cells at 7.5% density the rule takes 6.78 s with nothing dropped,
-/// 5.19 s at `1e-14`, 5.00 s here and 4.59 s at `1e-6`. Worst drift in the log
-/// fold change, in units of the error bar the method reports for it, measured
-/// on 200 genes over 2000 cells against an unpruned run: `4e-10` error bars at
-/// `1e-12`, `1e-8` here, `1e-4` at `1e-6`. Almost all of the saving is already
-/// had at `1e-14`, so this sits well inside the flat part of the curve.
+/// Picked by measurement, 2026-09-13, on simulated data: almost all of the
+/// saving is already had at `1e-14`, and the drift in the log fold change
+/// against an unpruned run stays orders of magnitude below an error bar, so
+/// this sits well inside the flat part of the curve.
 ///
 /// Must stay strictly positive. It is also what stops the leading run of
 /// underflowed bins from reaching the Welford update, where the first one would
@@ -66,10 +62,8 @@ pub(crate) const MARGINALISE_MIN_WEIGHT: f64 = 1e-10;
 /// fewer iterations, which is why the crossover lands at one half rather than
 /// below it.
 ///
-/// Measured 2026-09-30 on an M1 Max, `PosteriorMean`, 400 simulated genes over
-/// 4000 cells, two interleaved passes. At 40.6% overall density: 1.93 s at
-/// `0.4`, 1.87 s here, 1.87 s at `0.6`, 1.93 s at `0.7`, 2.09 s at `0.3`, 2.36 s
-/// with no gate. At 59.8%: 2.45 s, 2.41 s, 2.40 s, 2.46 s, 2.57 s and 3.36 s.
+/// Picked by measurement, 2026-09-30, on simulated data with `PosteriorMean`;
+/// the optimum is flat between `0.4` and `0.6`.
 pub(crate) const SPARSE_MAX_DENSITY: f64 = 0.5;
 
 /// Chebyshev degree of the fit that fills in the empty cells.
@@ -78,13 +72,11 @@ pub(crate) const SPARSE_MAX_DENSITY: f64 = 0.5;
 /// second pass evaluates them at the nodes of one fit over the run's range of
 /// `ln T` and interpolates to every empty cell.
 ///
-/// Measured 2026-09-30 on an M1 Max, `Marginalise`, 400 simulated genes over
-/// 4000 cells, worst log fold change against the per-cell pass in units of its
-/// error bar. Library log sd 0.5: `1.7e-6` at degree 16, `3.5e-9` at 24,
-/// `1.1e-11` at 32 and 48. Log sd 1.5, a spread well past droplet data:
-/// `2.1e-5`, `1.2e-7`, `9.1e-10`, `5.9e-12`. Wall clock did not move with the
-/// degree (0.49 to 0.53 s at sd 0.5), so this takes the degree that stays at
-/// the per-cell pass's own noise across both.
+/// Measured 2026-09-30 on simulated data, worst log fold change against the
+/// per-cell pass in units of its error bar: `1.1e-11` at this degree for a
+/// library log sd of 0.5 and `9.1e-10` for 1.5, a spread well past droplet
+/// data. Run time did not depend on the degree, so this takes the degree that
+/// stays at the per-cell pass's own noise across both.
 const EMPTY_FIT_DEGREE: usize = 48;
 
 /// Smallest width of the fit's interval in `ln T`.

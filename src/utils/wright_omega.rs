@@ -26,8 +26,7 @@
 /// bounds the error in `t` directly, but `g` is evaluated as a sum containing
 /// `exp(t)`, whose own ulp exceeds an absolute `1e-14` once `omega > 90`. An
 /// absolute test there is unreachable and costs the full iteration cap.
-/// Measured 2026-09-13: absolute, `x = 100`, `1e3` and `1e5` all took 8
-/// iterations; relative, 3.
+/// Measured 2026-09-13.
 const OMEGA_TOL: f64 = 1e-14;
 
 /// Iteration cap for the Halley solve.
@@ -78,12 +77,6 @@ pub(crate) fn log_omega(x: f64) -> f64 {
 /// `dt / dx = 1 / (1 + omega)`, one first-order step lands within `O(dx^2)` of
 /// the root, and Halley is cubic from there. This replaces the cold guess's
 /// `ln` with a divide and, when `dx` is small, cuts the iteration count.
-///
-/// Measured 2026-09-13 on an M1 Max, 40 simulated genes over 1000 cells at 161
-/// bins, counting loop entries. Under `Marginalise` the cold entry point
-/// averaged 2.79 per call; routing the sweeps through here brings it to 1.92,
-/// and drops the cold guess's `ln` with it. `VarianceRule::Fixed` is one cold
-/// solve per gene and still sits at 2.33.
 ///
 /// ### Params
 ///

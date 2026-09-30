@@ -59,11 +59,8 @@ const OFFSET_MAX_BRACKET: usize = 60;
 /// so a small first step usually flips on the first try and leaves a bracket
 /// narrow enough for Newton to close in two iterations.
 ///
-/// Measured 2026-09-13 on an M1 Max, 200 simulated genes over 4000 cells at
-/// 7.5% density and 161 bins, two interleaved passes. Wall clock for
-/// `PosteriorMean`: 1.0 gives 2.65 s, 0.25 gives 1.97 s, 0.125 gives 1.85 s,
-/// 0.0625 gives 1.53 s, 0.03125 gives 1.49 s, 0.015625 gives 1.46 s. The curve
-/// is flat below 0.03125, so anything smaller only buys extra doublings when a
+/// Picked by measurement, 2026-09-13, on simulated data. The curve is flat
+/// below this value, so anything smaller only buys extra doublings when a
 /// guess turns out worse than this data makes it.
 const OFFSET_BRACKET_STEP_WARM: f64 = 0.03125;
 
@@ -73,9 +70,9 @@ const OFFSET_BRACKET_STEP_WARM: f64 = 0.03125;
 /// full sweep over the cells, so starting as small as the warm step just buys
 /// four extra sweeps before the bracket is wide enough to contain the root.
 ///
-/// Measured 2026-09-13, same machine and data: sharing the warm step's value
-/// put `VarianceRule::Fixed`, which is one cold solve per gene and nothing
-/// else, at 0.105 s against 0.051 s here.
+/// Picked by measurement, 2026-09-13: sharing the warm step's value made
+/// `VarianceRule::Fixed`, which is one cold solve per gene and nothing else,
+/// slower.
 const OFFSET_BRACKET_STEP_COLD: f64 = 1.0;
 
 /// The stationary point of one gene at one variance.

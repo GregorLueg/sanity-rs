@@ -29,12 +29,10 @@ use crate::utils::wright_omega::{log_omega, omega_from_log};
 
 /// Chebyshev degree of each panel. Even, so the midpoint is a node.
 ///
-/// Measured 2026-09-30 on an M1 Max, simulated totals, `max_vs = 1.5e7`: 35
-/// panels and a 0.03 s build at 4000 cells, 30 and 0.11 s at 20000, 26 and
-/// 0.94 s at 200000. Worst relative error against the compensated direct sum
-/// `1.5e-14`, `3e-14` for `sum omega^2`. One evaluation is about 100 ns, noise
-/// against the `O(nnz)` omega solves of the sweep it replaces the empty cells
-/// of, so the degree was not tuned further.
+/// Measured 2026-09-30 on simulated totals: worst relative error against the
+/// compensated direct sum `1.5e-14`, `3e-14` for `sum omega^2`. One evaluation
+/// is noise against the `O(nnz)` omega solves of the sweep it replaces the
+/// empty cells of, so the degree was not tuned further.
 const PANEL_DEGREE: usize = 16;
 
 /// Points per panel.
@@ -48,7 +46,7 @@ pub(crate) const N_SUMS: usize = 4;
 /// A panel whose last two coefficients exceed this, for any of the four sums,
 /// is split in half.
 ///
-/// Measured 2026-09-30 on 2000 simulated cells: the tail of a converged panel
+/// Measured 2026-09-30 on simulated cells: the tail of a converged panel
 /// sits at `2e-16` to `5e-15`, the rounding floor of the node values, so
 /// `1e-15` could not be met and the split never stopped. This is a decade above
 /// that floor.
@@ -206,9 +204,9 @@ impl ShiftTable {
     /// Panels are split in half until every sum's Chebyshev tail is below
     /// [`PANEL_TOL`]. Node sums run in parallel, over the distinct totals.
     ///
-    /// Summing over distinct totals rather than cells measured 2026-09-30 on
-    /// an M1 Max: at 200000 simulated cells the build was 0.94 s over cells,
-    /// about 1.4 s of a 3.5 s GPU run, which erased that path's gain.
+    /// Summing over distinct totals rather than cells matters at large cell
+    /// counts: the build over cells was a large share of a GPU run and erased
+    /// that path's gain.
     ///
     /// ### Params
     ///
