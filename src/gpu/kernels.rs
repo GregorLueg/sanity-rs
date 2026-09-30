@@ -12,6 +12,8 @@
 
 use cubecl::prelude::*;
 
+use crate::model::empty_cells::{N_SUMS, PANEL_POINTS};
+
 ////////////
 // Consts //
 ////////////
@@ -297,29 +299,57 @@ fn log_fold_change<F: Float>(k: F, x: F, t: F, w: F, v: F, lt: F, shift: F) -> F
 /// holding a quarter of the reads put `f32` rounding at units in the log
 /// likelihood.
 ///
+/// With the table, a gene lists only its nonzero cells. Each also removes its
+/// own empty-argument terms, `omega(ln T_c + shift)`, which the table's
+/// all-cell sums include; the table is added after the reduction. Those terms
+/// depend on the cell only through its total, so the removed share is about the
+/// gene's density times the table's, and the difference cancels by at most that
+/// factor. Without the table a gene walks its dense row instead.
+///
 /// ### Params
 ///
-/// * `counts` - Dense counts, gene-major.
+/// * `counts` - Dense counts, gene-major, for a gene without the table.
+/// * `list_offsets` - Start of each gene's listed cells, length `n_genes + 1`.
+/// * `list_cells` - Cell index of each listed cell.
+/// * `list_counts` - Count of each listed cell.
 /// * `log_totals` - `ln T_c` per cell.
-/// * `row` - Start of this gene's row in `counts`.
 /// * `n_cells` - Number of cells.
+/// * `gene` - This gene.
+/// * `use_table` - Whether this gene's empty cells come from the table.
+/// * `table` - The table's four tensors and panel count; see [`table_sums`].
 /// * `partials` - Shared scratch, [`N_TOTALS`]` * `[`MAX_PLANES_PER_GENE`].
 /// * `v` - The variance bin.
 /// * `shift` - `ln(v s) - z`.
 /// * `tot` - Output, five totals: `sum d`, `S_A = sum omega / (1 + omega)`,
 ///   `sum d^2`, `sum_{k > 0} k ln(omega / (v k))` and
 ///   `sum_{k = 0} ln(1 + omega) + sum_{k > 0} ln((1 + omega) / (v k))`.
+///   Without the table's share for a table gene.
+/// * `tab` - Output, the table's share of each total, in `f32`; zero for a
+///   gene without the table. Kept apart so the host can replace it with the
+///   same share in `f64`: the solve only needs its sign and slope, but the
+///   likelihood takes the off-root term `sum d / v`, which carries `f32`
+///   rounding of `G_omega` times `s`.
 #[cube]
 #[allow(clippy::too_many_arguments)]
 fn sweep<F: Float>(
     counts: &Tensor<F>,
+    list_offsets: &Tensor<u32>,
+    list_cells: &Tensor<u32>,
+    list_counts: &Tensor<F>,
     log_totals: &Tensor<F>,
-    row: u32,
     n_cells: u32,
+    gene: u32,
+    use_table: bool,
+    table_breaks: &Tensor<F>,
+    table_anchors: &Tensor<F>,
+    table_coeffs: &Tensor<F>,
+    table_scalars: &Tensor<F>,
+    n_panels: u32,
     partials: &mut SharedMemory<F>,
     v: F,
     shift: F,
     tot: &mut Array<F>,
+    tab: &mut Array<F>,
 ) {
     let zero = F::new(0.0_f32);
     let one = F::new(1.0_f32);
@@ -329,10 +359,20 @@ fn sweep<F: Float>(
     let mut sum_kw = zero;
     let mut sum_log1p = zero;
 
-    let mut c = UNIT_POS_X;
-    while c < n_cells {
-        let k = counts[(row + c) as usize];
-        let lt = log_totals[c as usize];
+    let start = list_offsets[gene as usize];
+    let mut n = n_cells;
+    if use_table {
+        n = list_offsets[(gene + 1u32) as usize] - start;
+    }
+    let row = gene * n_cells;
+    let mut j = UNIT_POS_X;
+    while j < n {
+        let mut k = counts[(row + j) as usize];
+        let mut lt = log_totals[j as usize];
+        if use_table {
+            k = list_counts[(start + j) as usize];
+            lt = log_totals[list_cells[(start + j) as usize] as usize];
+        }
         let x = v * k + lt + shift;
         let t = log_omega::<F>(x);
         let w = omega_from_log::<F>(x, t);
@@ -347,7 +387,16 @@ fn sweep<F: Float>(
         } else {
             sum_log1p += log1p::<F>(w);
         }
-        c += CUBE_DIM_X;
+        if use_table && k > zero {
+            let x0 = lt + shift;
+            let w0 = omega_from_log::<F>(x0, log_omega::<F>(x0));
+            // An empty cell's `d` is `-omega`, so removing its term adds `omega`.
+            sum_d += w0;
+            curvature -= w0 / (one + w0);
+            sum_sq -= w0 * w0;
+            sum_log1p -= log1p::<F>(w0);
+        }
+        j += CUBE_DIM_X;
     }
 
     let plane_d = plane_sum(sum_d);
@@ -383,6 +432,110 @@ fn sweep<F: Float>(
     }
     // Nobody may overwrite the partials until every thread has read them.
     sync_cube();
+
+    let mut q = 0u32;
+    while q < N_TOTALS {
+        tab[q as usize] = zero;
+        q += 1u32;
+    }
+    if use_table {
+        table_sums::<F>(
+            table_breaks,
+            table_anchors,
+            table_coeffs,
+            table_scalars,
+            n_panels,
+            shift,
+            tab,
+        );
+    }
+}
+
+/// Add the table's all-cell empty-argument sums at `shift` to the totals.
+///
+/// The device twin of `crate::model::empty_cells::ShiftTable::eval`, in `f32`:
+/// the asymptotic form below the table, the panel's Chebyshev series inside it.
+/// Above the table the shift is clamped to its top. No root lies there, and the
+/// clamped sums keep the residual's sign: the table's top was chosen so that
+/// `G_omega` there exceeds every `v s` of the run, and a nonzero cell's own
+/// `omega` is at least its empty-argument one, so `sum_c omega_c - v s` stays
+/// positive and the bracket still moves the right way.
+///
+/// ### Params
+///
+/// * `breaks` - Panel boundaries, length `n_panels + 1`.
+/// * `anchors` - `G_f` at each panel's midpoint, `[panel * N_SUMS + f]`.
+/// * `coeffs` - Chebyshev coefficients of `ln(G_f / G_f(mid))`,
+///   `[(panel * N_SUMS + f) * PANEL_POINTS + k]`.
+/// * `scalars` - `ln(sum_c T_c)`, then `ln(sum_c T_c^2)`.
+/// * `n_panels` - Number of panels.
+/// * `shift` - `ln(v s) - z`.
+/// * `tot` - Five totals laid out as [`sweep`]'s; four are added to.
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn table_sums<F: Float>(
+    breaks: &Tensor<F>,
+    anchors: &Tensor<F>,
+    coeffs: &Tensor<F>,
+    scalars: &Tensor<F>,
+    n_panels: u32,
+    shift: F,
+    tot: &mut Array<F>,
+) {
+    let two = F::new(2.0_f32);
+    if shift < breaks[0] {
+        let w = F::exp(shift + scalars[0]);
+        tot[0] -= w;
+        tot[1] += w;
+        tot[2] += F::exp(two * shift + scalars[1]);
+        tot[4] += w;
+    } else {
+        let s = F::min(shift, breaks[n_panels as usize]);
+        // Largest `lo` with `breaks[lo] <= s`, at most the last panel.
+        let mut lo = 0u32;
+        let mut hi = n_panels;
+        while hi - lo > 1u32 {
+            let mid = (lo + hi) / 2u32;
+            if breaks[mid as usize] <= s {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let a = breaks[lo as usize];
+        let b = breaks[(lo + 1u32) as usize];
+        let t = (two * s - a - b) / (b - a);
+
+        let mut f = 0u32;
+        while f < N_SUMS as u32 {
+            let base = (lo * N_SUMS as u32 + f) * PANEL_POINTS as u32;
+            // Clenshaw's recurrence, as `crate::utils::chebyshev::clenshaw`.
+            let mut b1 = F::new(0.0_f32);
+            let mut b2 = F::new(0.0_f32);
+            // Counted up from a literal: a counter initialised from a
+            // comptime constant is immutable to the cube expansion.
+            let mut i = 1u32;
+            while i < PANEL_POINTS as u32 {
+                let k = PANEL_POINTS as u32 - i;
+                let b0 = two * t * b1 - b2 + coeffs[(base + k) as usize];
+                b2 = b1;
+                b1 = b0;
+                i += 1u32;
+            }
+            let series = t * b1 - b2 + coeffs[base as usize];
+            let g = anchors[(lo * N_SUMS as u32 + f) as usize] * F::exp(series);
+            if f == 0u32 {
+                tot[0] -= g;
+            } else if f == 1u32 {
+                tot[1] += g;
+            } else if f == 2u32 {
+                tot[2] += g;
+            } else {
+                tot[4] += g;
+            }
+            f += 1u32;
+        }
+    }
 }
 
 /// The half-unit drop of SI eq. 38 at a trial `sigma`, minus the half unit.
@@ -509,15 +662,25 @@ fn gaussian_variance<F: Float>(v: F, w: F, curvature: F) -> F {
 ///
 /// ### Params
 ///
-/// * `counts` - Dense counts, `[gene * n_cells + c]`.
+/// * `counts` - Dense counts, `[gene * n_cells + c]`, read for genes without
+///   the table.
+/// * `list_offsets` - Start of each gene's listed cells, length `n_genes + 1`.
+/// * `list_cells` - Cell index of each listed cell.
+/// * `list_counts` - Count of each listed cell.
 /// * `log_totals` - `ln T_c`, length `n_cells`.
 /// * `gene_scalars` - `[r * n_genes + gene]`: `K`, then the first bin's guess
-///   for `zeta`.
+///   for `zeta`, then `1` if the gene's empty cells come from the table and
+///   only its nonzero cells are listed, `0` if it walks its dense row.
+/// * `table_breaks`, `table_anchors`, `table_coeffs`, `table_scalars`,
+///   `n_panels` - The empty-cell table; see [`table_sums`]. Placeholders when
+///   no gene uses it.
 /// * `bins` - `[(r * n_genes + gene) * n_bins + b]`: `v`, then `ln(v s) - a_b`,
 ///   then the anchor step `a_b - a_{b-1}` (zero at the first bin).
 /// * `out` - `[(r * n_genes + gene) * n_bins + b]`: `zeta`, then totals one to
 ///   four of `sweep`, then total zero, the residual `sum d` the solve
-///   stopped at. All at the converged offset.
+///   stopped at. All at the converged offset. For a table gene, total one
+///   (`S_A`, which the second pass reads) includes the table's share and the
+///   others do not; the host adds theirs in `f64`.
 /// * `status` - Per gene: `0` if every bin converged, else `1 +` the first bin
 ///   that did not. Bins after it are left unwritten.
 /// * `n_genes` - Genes in the launch.
@@ -533,8 +696,16 @@ fn gaussian_variance<F: Float>(v: F, w: F, curvature: F) -> F {
 #[allow(clippy::too_many_arguments)]
 pub fn sweep_grid_gpu<F: Float + CubeElement>(
     counts: &Tensor<F>,
+    list_offsets: &Tensor<u32>,
+    list_cells: &Tensor<u32>,
+    list_counts: &Tensor<F>,
     log_totals: &Tensor<F>,
     gene_scalars: &Tensor<F>,
+    table_breaks: &Tensor<F>,
+    table_anchors: &Tensor<F>,
+    table_coeffs: &Tensor<F>,
+    table_scalars: &Tensor<F>,
+    n_panels: u32,
     bins: &Tensor<F>,
     out: &mut Tensor<F>,
     status: &mut Tensor<u32>,
@@ -549,13 +720,14 @@ pub fn sweep_grid_gpu<F: Float + CubeElement>(
     }
     let lead = UNIT_POS_X == 0u32;
     let mut partials = SharedMemory::<F>::new((N_TOTALS * MAX_PLANES_PER_GENE) as usize);
-    let row = gene * n_cells;
     let zero = F::new(0.0_f32);
+    let use_table = gene_scalars[(2u32 * n_genes + gene) as usize] > zero;
     let one = F::new(1.0_f32);
 
     // `z` below is the anchored offset `zeta = z - a_b`; see [`OFFSET_ULPS_F32`].
     let mut z = gene_scalars[(n_genes + gene) as usize];
     let mut tot = Array::<F>::new(N_TOTALS as usize);
+    let mut tab = Array::<F>::new(N_TOTALS as usize);
     let mut failed: u32 = 0u32;
 
     let mut b = 0u32;
@@ -569,15 +741,25 @@ pub fn sweep_grid_gpu<F: Float + CubeElement>(
         // `F(z) = sum_c omega_c - v s = -sum_c d_c`; see `sweep`.
         sweep::<F>(
             counts,
+            list_offsets,
+            list_cells,
+            list_counts,
             log_totals,
-            row,
             n_cells,
+            gene,
+            use_table,
+            table_breaks,
+            table_anchors,
+            table_coeffs,
+            table_scalars,
+            n_panels,
             &mut partials,
             v,
             log_vs - z,
             &mut tot,
+            &mut tab,
         );
-        let mut f = zero - tot[0];
+        let mut f = zero - (tot[0] + tab[0]);
 
         // `F` is strictly decreasing in `z`, so a positive residual means `z`
         // is too small. Expand outwards by doubling until the sign flips.
@@ -599,15 +781,25 @@ pub fn sweep_grid_gpu<F: Float + CubeElement>(
             }
             sweep::<F>(
                 counts,
+                list_offsets,
+                list_cells,
+                list_counts,
                 log_totals,
-                row,
                 n_cells,
+                gene,
+                use_table,
+                table_breaks,
+                table_anchors,
+                table_coeffs,
+                table_scalars,
+                n_panels,
                 &mut partials,
                 v,
                 log_vs - z,
                 &mut tot,
+                &mut tab,
             );
-            f = zero - tot[0];
+            f = zero - (tot[0] + tab[0]);
             if (ascending && f <= zero) || (!ascending && f >= zero) {
                 break;
             }
@@ -628,7 +820,7 @@ pub fn sweep_grid_gpu<F: Float + CubeElement>(
             let mut iteration = 0u32;
             loop {
                 // The Newton step `f / S_A` is below the offset's resolution.
-                if F::abs(f) <= resolution * (one + F::abs(z)) * tot[1] {
+                if F::abs(f) <= resolution * (one + F::abs(z)) * (tot[1] + tab[1]) {
                     break;
                 }
                 if f > zero {
@@ -645,7 +837,7 @@ pub fn sweep_grid_gpu<F: Float + CubeElement>(
                     break;
                 }
                 // F'(z) = -S_A, which the sweep at `z` already reduced.
-                let next = z + f / tot[1];
+                let next = z + f / (tot[1] + tab[1]);
                 if next > lo && next < hi {
                     z = next;
                 } else {
@@ -653,15 +845,25 @@ pub fn sweep_grid_gpu<F: Float + CubeElement>(
                 }
                 sweep::<F>(
                     counts,
+                    list_offsets,
+                    list_cells,
+                    list_counts,
                     log_totals,
-                    row,
                     n_cells,
+                    gene,
+                    use_table,
+                    table_breaks,
+                    table_anchors,
+                    table_coeffs,
+                    table_scalars,
+                    n_panels,
                     &mut partials,
                     v,
                     log_vs - z,
                     &mut tot,
+                    &mut tab,
                 );
-                f = zero - tot[0];
+                f = zero - (tot[0] + tab[0]);
             }
         }
 
@@ -673,7 +875,7 @@ pub fn sweep_grid_gpu<F: Float + CubeElement>(
             let base = gene * n_bins + b;
             let stride = n_genes * n_bins;
             out[base as usize] = z;
-            out[(stride + base) as usize] = tot[1];
+            out[(stride + base) as usize] = tot[1] + tab[1];
             out[(2u32 * stride + base) as usize] = tot[2];
             out[(3u32 * stride + base) as usize] = tot[3];
             out[(4u32 * stride + base) as usize] = tot[4];

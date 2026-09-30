@@ -115,8 +115,10 @@ let client = WgpuRuntime::client(&WgpuDevice::default());
 let out = sanity_gpu::<f32, WgpuRuntime>(&counts, &cell_totals, None, &client)?;
 ```
 
-On an M1 Max against all ten CPU cores, `Marginalise` runs 78x faster at 2000
-genes by 20000 cells and 60x at 500 by 200000; see `docs/BENCHMARKS.md`.
+On an M1 Max against all ten CPU cores, `Marginalise` runs 18x faster at 2000
+genes by 20000 cells and 27x at 500 by 200000; see `docs/BENCHMARKS.md`. The
+ratios dropped from the 78x and 60x of v0.2 because the CPU got 5x to 8x faster,
+not because the GPU got slower. It got faster too.
 
 wgpu has no `f64`, so the device works in `f32`. The per-cell maths is
 rearranged so no sum ever cancels, the offset is solved relative to an `f64`
@@ -124,15 +126,22 @@ anchor held by the host, and the likelihood over the variance grid is
 assembled in `f64` on the host. Against the CPU path the worst log fold change
 moves by under 1% of its own error bar, which is as far as the variance grid
 itself is resolved. `MaxPosterior` settles near ties between bins on the CPU,
-so it matches bin for bin but gains less.
+so it matches bin for bin.
 
 ## Design
 
 Genes are independent under this model, so the method is one Rayon `par_iter`
 over genes and nothing else. Each worker holds `O(n_bins + n_cells)` scratch and
-reuses it across genes. The input stays sparse; the algorithm is dense in the
-cell axis, because a cell with zero counts still contributes through its library
-size.
+reuses it across genes.
+
+A cell with zero counts still contributes through its library size, so the
+maths is dense in the cell axis. The work isn't. An empty cell depends on the
+gene only through one scalar offset and on itself only through `ln T_c`, so its
+sums come from a Chebyshev table in that offset, built once per run, and its
+outputs from a Chebyshev fit in `ln T_c`. Per gene, the root solves run over the
+nonzero cells plus 49 nodes. At 8% density that's where the 5x to 8x over the
+dense sweep comes from. Genes above 50% density, metacells for instance, keep
+the dense sweep.
 
 The per-cell stationarity condition is solved as Wright omega rather than
 Lambert W. The Lambert form overflows for ordinary inputs; the Wright form

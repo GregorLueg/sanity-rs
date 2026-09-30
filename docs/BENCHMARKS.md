@@ -1,83 +1,86 @@
-# Benchmarks against the reference binary
+# Benchmarks
+
+Numbers for the current version, v0.3.0. Older ones live in the git history of
+this file.
+
+Machine: Apple M1 Max, 10 cores, 64 GB, macOS 26.6.2, release profile. Input is
+this crate's simulator throughout. macOS background daemons kept the load
+average between 7 and 80 during the 2026-09-30 runs, so treat single timings as
+good to 10 to 20%.
+
+## Against the reference binary
 
 Black-box comparison with the reference Sanity binary (v2.0.0, built from
-`jmbreda/Sanity`), under the terms in `docs/PROVENANCE.md`. The harness lives
-outside this repository at `~/repos/others/sanity-comparison`.
+`jmbreda/Sanity`), under the terms in `docs/PROVENANCE.md`. The harness is
+private and lives outside this repository. Both read the same Matrix Market
+file and write text output. Run: `Marginalise` / `-v_m MARG`, 160 bins over
+`[1e-3, 50]`. Wall time and peak RSS are for the whole process, from
+`/usr/bin/time -l`.
 
-## 2026-09-24, sanity-rs 41edaf1
+The reference timings are from 2026-09-24, same machine; the binary has not
+changed since. Ours are from 2026-09-30.
 
-Machine: Apple M1 Max, 10 cores, 64 GB, macOS 26.6.2, rustc 1.95.0, release
-profile.
-
-Input: this crate's simulator, 490 genes by 2000 cells (500 requested, 10 came
-back empty), library size 125, 77 359 stored counts (7.9% dense). Both read the
-same Matrix Market file and write text output. Run: `Marginalise` / `-v_m MARG`,
-160 bins over `[1e-3, 50]`.
-
-Wall time and peak RSS are for the whole process, from `/usr/bin/time -l`.
+490 genes by 2000 cells (500 requested, 10 came back empty), library size 125,
+77 359 stored counts (7.9% dense):
 
 | threads | wall, ours | wall, reference | speedup | peak RSS, ours | peak RSS, reference |
 |---|---|---|---|---|---|
-| 1 | 27.8 s | 74.9 s | 2.7x | 27.6 MB | 9.9 MB |
-| 8 | 4.2 s | 10.4 s | 2.5x | 29.4 MB | 55.4 MB |
+| 1 | 3.28 s | 74.9 s | 23x | 27.9 MB | 9.9 MB |
+| 8 | 0.59 s | 10.4 s | 18x | 30.4 MB | 55.4 MB |
 
-Our split at 8 threads: parse 0.006 s, compute 4.03 s, write 0.18 s.
-
-By arithmetic, not profiling: the two dense gene-by-cell `f64` outputs of
-`sanity` are 15.7 MB, and the harness adds a third, 7.8 MB, for
-`log_transcription_quotients`. The reference's peak grows with the thread count.
-
-At scale, 1998 genes by 20 000 cells (2000 requested), library size 500,
-3 552 556 stored counts (8.9% dense), same settings:
+1998 genes by 20000 cells (2000 requested), library size 500, 3 552 556 stored
+counts (8.9% dense):
 
 | threads | wall, ours | wall, reference | speedup | peak RSS, ours | peak RSS, reference |
 |---|---|---|---|---|---|
-| 8 | 121.4 s | 415.1 s | 3.4x | 1012 MB | 937 MB |
+| 8 | 22.3 s | 415.1 s | 19x | 1079 MB | 937 MB |
 
-Our split: parse 0.26 s, compute 114.2 s, write 6.9 s. The harness's extra copy
-for `log_transcription_quotients` is 320 MB of our peak.
+Our split at that size: parse 0.26 s, compute 14.7 s, write 7.3 s. A third of
+the wall clock is now formatting 40 million numbers as text. The harness keeps
+an extra copy for `log_transcription_quotients`, 320 MB of our peak.
 
-In both runs the outputs agree: per-gene correlation of the log transcription
-quotients and of their error bars is 1.0000 on every gene, and the largest
-absolute difference in log transcription quotient is below `5e-4`.
+The outputs agree to the precision written: per-gene correlation of the log
+transcription quotients and of their error bars is 1.0000 on every gene, and
+the largest absolute difference in log transcription quotient is `3e-6` at both
+sizes, against six decimals in the text files.
 
-## 2026-09-24, GPU against CPU, sanity-sc-rs c0c5192
+## GPU against CPU
 
-Both paths of this crate, same process, `examples/profile_gpu.rs`. Machine as
-above; the GPU is the M1 Max's own, through wgpu on Metal. CPU is `sanity` on
-10 Rayon threads in `f64`; GPU is `sanity_gpu`, `f32` on the device with the
-likelihood assembled in `f64` on the host. Simulated counts, library size 500,
-161 bins over `[1e-3, 50]`. Wall clock of the call only, kernels compiled
-beforehand.
-
-Errors are the GPU against the CPU, worst gene: the log fold change in units
-of the CPU's own error bar, and the absolute error in the log transcription
-quotient `m + d_c`.
+Both paths in one process, `examples/profile_gpu.rs`, sanity-sc-rs bed11ca. CPU
+is `sanity` on 10 threads in `f64`; GPU is `sanity_gpu` through wgpu on Metal.
+Library size 500, 161 bins over `[1e-3, 50]`. Wall clock of the call only,
+kernels compiled beforehand. Errors are the GPU against the CPU, worst gene:
+the log fold change in units of the CPU's own error bar, and the absolute error
+in the log transcription quotient `m + d_c`.
 
 1998 genes by 20000 cells:
 
 | rule | CPU | GPU | speedup | worst `d_c` / `e_c` | worst `m + d_c` |
 |---|---|---|---|---|---|
-| `Marginalise` | 108.1 s | 1.39 s | 77.9x | `1.9e-4` | `5.9e-5` |
-| `PosteriorMean` | 72.0 s | 1.19 s | 60.8x | `1.9e-4` | `1.1e-4` |
-| `MaxPosterior` | 72.7 s | 4.78 s | 15.2x | `4.4e-5` | `8.1e-6` |
-| `Fixed(1.0)` | 1.28 s | 0.15 s | 8.4x | `5.5e-5` | `1.5e-6` |
+| `Marginalise` | 14.4 s | 0.82 s | 17.7x | `4.0e-4` | `1.1e-4` |
+| `PosteriorMean` | 14.1 s | 0.55 s | 25.7x | `4.6e-4` | `1.7e-4` |
+| `MaxPosterior` | 14.2 s | 0.61 s | 23.2x | `4.4e-5` | `8.1e-6` |
+| `Fixed(1.0)` | 1.53 s | 0.21 s | 7.2x | `5.5e-5` | `1.5e-6` |
 
 500 genes by 200000 cells:
 
 | rule | CPU | GPU | speedup | worst `d_c` / `e_c` | worst `m + d_c` |
 |---|---|---|---|---|---|
-| `Marginalise` | 207.2 s | 3.47 s | 59.6x | `2.7e-3` | `3.1e-4` |
-| `PosteriorMean` | 188.6 s | 3.79 s | 49.8x | `4.8e-3` | `3.1e-4` |
-| `MaxPosterior` | 188.8 s | 7.99 s | 23.6x | `1.0e-4` | `6.0e-6` |
-| `Fixed(1.0)` | 3.16 s | 0.36 s | 8.7x | `1.5e-4` | `1.6e-6` |
+| `Marginalise` | 63.2 s | 2.36 s | 26.8x | `1.9e-3` | `5.3e-4` |
+| `PosteriorMean` | 61.9 s | 2.24 s | 27.6x | `2.1e-3` | `5.3e-4` |
+| `MaxPosterior` | 62.9 s | 2.23 s | 28.2x | `2.1e-4` | `5.6e-6` |
+| `Fixed(1.0)` | 4.04 s | 0.57 s | 7.0x | `2.7e-4` | `1.5e-6` |
 
-Every error sits below 1% of an error bar, which is as far as the variance
-grid itself is resolved, and every log transcription quotient within the
-`5e-4` by which this crate and the reference binary agree above. The worst
-genes are the most expressed ones (`K` near `3e5`) at 200000 cells.
+Every error sits below 1% of an error bar, which is as far as the variance grid
+itself is resolved. The worst genes are the most expressed ones at large `v`,
+where the posterior over the variance is broad and small differences in the bin
+likelihoods move the weights. Bonsai reads `log_fold_changes`, so the `d_c`
+column is the one that reaches it.
 
-`MaxPosterior` is the slow one on the GPU because its argmax is discrete: bins
-the device cannot separate from the best are re-solved on the CPU in `f64`, and
-genes with little data have long flat stretches of near-equal bins.
+The CPU path agrees with the reference binary to the precision written, so the
+GPU's worst `m + d_c` of `5.3e-4` at 200000 cells is also its distance from the
+reference.
 
+`MaxPosterior` re-solves bins the device cannot separate from the best in `f64`
+on the CPU. Those re-solves run the same sparse path as `sanity`, so they cost
+little, and the rule lands on the same bin as the CPU.

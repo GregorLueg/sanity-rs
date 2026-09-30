@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.3.0
+
+### Performance
+
+* The CPU path no longer solves cells with zero counts one by one. An empty
+  cell depends on the gene only through one scalar offset, so the first pass
+  reads its sums from a table built once per run, and the second pass
+  evaluates empty cells at 49 Chebyshev nodes in `ln T` and interpolates.
+* Genes above 50% density keep the dense first pass; below that the sparse one
+  wins. Metacell-style data is never slower than before.
+* The GPU first pass uses the same table for genes up to 50% dense. 1.5x to
+  1.7x on `Marginalise` and `PosteriorMean`, 6x on `MaxPosterior`, whose near
+  ties are now re-solved sparse on the CPU. The worst log fold change against
+  the CPU path goes from `2e-4` to `4e-4` of an error bar at 20000 cells.
+
+### Fixes
+
+* A warm-started Wright omega solve that did not converge within its eight
+  iterations returned the unconverged root silently. It now restarts cold.
+
 ## v0.2.1
 
 ### Features

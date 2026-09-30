@@ -64,8 +64,8 @@ pub(crate) fn gaussian_variance(v: f64, omega: f64, curvature_sum: f64) -> f64 {
 /// leading-order guess and is used to seed the bracket.
 ///
 /// Seeding from the previous bin's `sigma` instead, since the second pass walks
-/// a cell through the grid in order, was measured on 2026-09-13 and was 15%
-/// slower over the whole rule. The grid ascends, so the previous root always
+/// a cell through the grid in order, was measured slower over the
+/// whole rule. The grid ascends, so the previous root always
 /// undershoots and the bracket loop must double at least once, overshooting to
 /// twice it; the Gaussian width is already correct to leading order at the
 /// current `v` and needs no expansion at all.

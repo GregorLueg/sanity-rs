@@ -8,9 +8,12 @@
 //!
 //! The first pass is [`fn@kernels::sweep_grid_gpu`]: one workgroup of whole planes
 //! per gene, running the whole variance grid, with each cell sweep reduced
-//! across the workgroup so every thread agrees on the offset solve. The host
-//! then assembles each bin's log marginal likelihood in `f64` and forms the
-//! weights.
+//! across the workgroup so every thread agrees on the offset solve. A gene at
+//! most `SPARSE_MAX_DENSITY` dense walks only its nonzero cells and takes the
+//! empty cells' sums from the CPU's `ShiftTable`, uploaded in `f32` to steer
+//! the solve; the host adds the same sums back in `f64` (see [`finish_sweep`]).
+//! The host then assembles each bin's log marginal likelihood in `f64` and
+//! forms the weights.
 //! The second pass is [`fn@kernels::marginalise_gpu`]: one thread per gene and
 //! cell, integrating over the kept bins with the offsets the first pass left
 //! on the device.
@@ -60,12 +63,15 @@ use crate::config::{SanityParams, VarianceRule};
 use crate::errors::SanityErrors;
 use crate::float::{SanityFloat, narrow};
 use crate::input::CountMatrix;
+use crate::model::empty_cells::{EmptySums, N_SUMS, PANEL_POINTS, ShiftTable};
+use crate::model::fractions::NonzeroCells;
 use crate::model::gene::{
-    MARGINALISE_MIN_WEIGHT, collapse_target, log_marginal_at, marginal_summary, posterior_weights,
+    MARGINALISE_MIN_WEIGHT, SPARSE_MAX_DENSITY, collapse_target, log_marginal_at,
+    log_marginal_at_sparse, marginal_summary, posterior_weights,
 };
 use crate::utils::polygamma::{digamma, trigamma};
 use crate::utils::progress::report_decile_progress;
-use crate::{GeneView, SanityOutput, prepare_run, print_run_header};
+use crate::{GeneView, SanityOutput, prepare_run, print_run_header, shift_table};
 
 use self::kernels::{marginalise_gpu, sweep_grid_gpu};
 
@@ -110,8 +116,22 @@ const GPU_BATCH_BYTES: u64 = 512 << 20;
 
 /// One batch's resident inputs.
 struct Batch<R: Runtime> {
-    /// Dense counts, `[gene * n_cells + c]`.
+    /// Dense counts, `[gene * n_cells + c]`, for the second pass.
     counts: GpuTensor<R, f32>,
+    /// Start of each gene's listed cells for the first pass, length
+    /// `n_genes + 1`. Only table genes list any.
+    list_offsets: GpuTensor<R, u32>,
+    /// Cell index of each listed cell.
+    list_cells: GpuTensor<R, u32>,
+    /// Count of each listed cell.
+    list_counts: GpuTensor<R, f32>,
+    /// Most cells any one gene of the batch walks in the first pass.
+    max_walked: usize,
+    /// Cells per dense row.
+    counts_cells: usize,
+    /// Per gene, whether its empty cells come from the table, in which case
+    /// only its nonzero cells are listed.
+    use_table: Vec<bool>,
     /// `K` per gene.
     totals: Vec<f64>,
     /// Cells with a non-zero count, per gene.
@@ -120,6 +140,53 @@ struct Batch<R: Runtime> {
     first: usize,
     /// Genes in the batch.
     n_genes: usize,
+}
+
+/// The empty-cell table on the device, or placeholders when the run has none.
+struct DeviceTable<R: Runtime> {
+    /// Panel boundaries.
+    breaks: GpuTensor<R, f32>,
+    /// Midpoint anchors.
+    anchors: GpuTensor<R, f32>,
+    /// Chebyshev coefficients.
+    coeffs: GpuTensor<R, f32>,
+    /// `ln(sum_c T_c)` and `ln(sum_c T_c^2)`.
+    scalars: GpuTensor<R, f32>,
+    /// Number of panels.
+    n_panels: u32,
+}
+
+impl<R: Runtime> DeviceTable<R> {
+    /// Upload a table, or a one-panel placeholder that no gene reads.
+    ///
+    /// ### Params
+    ///
+    /// * `table` - The run's table, if it has one.
+    /// * `client` - CubeCL compute client.
+    ///
+    /// ### Returns
+    ///
+    /// The device table, or an upload error.
+    fn new(table: Option<&ShiftTable>, client: &ComputeClient<R>) -> Result<Self, SanityErrors> {
+        let [breaks, anchors, coeffs, scalars] = match table {
+            Some(t) => t.to_f32(),
+            None => [
+                vec![0.0, 1.0],
+                vec![1.0; N_SUMS],
+                vec![0.0; N_SUMS * PANEL_POINTS],
+                vec![0.0; 2],
+            ],
+        };
+        let n_panels = (breaks.len() - 1) as u32;
+        let up = |x: &[f32]| GpuTensor::<R, f32>::from_slice(x, vec![x.len()], client);
+        Ok(Self {
+            breaks: up(&breaks)?,
+            anchors: up(&anchors)?,
+            coeffs: up(&coeffs)?,
+            scalars: up(&scalars)?,
+            n_panels,
+        })
+    }
 }
 
 /// The first pass's output, on the device and read back.
@@ -131,9 +198,11 @@ struct SweepResult<R: Runtime> {
     bins: GpuTensor<R, f32>,
     /// Per-gene scalars the pass ran with.
     scalars: GpuTensor<R, f32>,
-    /// The output read back, `[(r * n_genes + gene) * n_bins + b]`. Row zero is
-    /// the anchored offset; [`SweepResult::offsets`] has it in `f64`.
-    host: Vec<f32>,
+    /// The output read back in `f64`, `[(r * n_genes + gene) * n_bins + b]`,
+    /// with each table gene's empty-cell share added; see [`finish_sweep`].
+    /// Row zero is the anchored offset; [`SweepResult::offsets`] has it
+    /// unanchored.
+    host: Vec<f64>,
     /// `z(v_b)` per gene and bin, the anchor added back in `f64`.
     offsets: Vec<f64>,
 }
@@ -155,13 +224,17 @@ fn offset_anchor(log_total_sum: f64, v: f64) -> f64 {
     log_total_sum + 0.5 * v
 }
 
-/// Upload one batch of genes as dense rows.
+/// Upload one batch of genes: dense rows, and the first pass's cell lists.
+///
+/// With a table, a gene at most [`SPARSE_MAX_DENSITY`] dense lists its nonzero
+/// cells; every other gene lists none and walks its dense row.
 ///
 /// ### Params
 ///
 /// * `counts` - The count matrix.
 /// * `first` - Input index of the first gene.
 /// * `n_genes` - Genes in the batch.
+/// * `has_table` - Whether the run has an empty-cell table.
 /// * `client` - CubeCL compute client.
 ///
 /// ### Returns
@@ -171,6 +244,7 @@ fn stage_batch<R: Runtime>(
     counts: &CountMatrix,
     first: usize,
     n_genes: usize,
+    has_table: bool,
     client: &ComputeClient<R>,
 ) -> Result<Batch<R>, SanityErrors> {
     let n_cells = counts.n_cells();
@@ -193,8 +267,45 @@ fn stage_batch<R: Runtime>(
             )
         })
         .unzip();
+
+    let use_table: Vec<bool> = (first..first + n_genes)
+        .map(|g| has_table && counts.gene(g).0.len() as f64 <= SPARSE_MAX_DENSITY * n_cells as f64)
+        .collect();
+    let mut list_offsets = Vec::with_capacity(n_genes + 1);
+    let mut list_cells: Vec<u32> = Vec::new();
+    let mut list_counts: Vec<f32> = Vec::new();
+    list_offsets.push(0u32);
+    let mut max_walked = 0;
+    for (g, &sparse) in use_table.iter().enumerate() {
+        if sparse {
+            let (indices, values) = counts.gene(first + g);
+            for (&i, &k) in indices.iter().zip(values) {
+                if k > 0 {
+                    list_cells.push(i);
+                    list_counts.push(k as f32);
+                }
+            }
+            max_walked =
+                max_walked.max(list_cells.len() - *list_offsets.last().unwrap_or(&0) as usize);
+        } else {
+            max_walked = n_cells;
+        }
+        list_offsets.push(list_cells.len() as u32);
+    }
+    // A batch with nothing listed still needs non-empty bindings.
+    if list_cells.is_empty() {
+        list_cells.push(0);
+        list_counts.push(0.0);
+    }
+
     Ok(Batch {
         counts: GpuTensor::from_slice(&dense, vec![n_genes * n_cells], client)?,
+        list_offsets: GpuTensor::from_slice(&list_offsets, vec![n_genes + 1], client)?,
+        list_cells: GpuTensor::from_slice(&list_cells, vec![list_cells.len()], client)?,
+        list_counts: GpuTensor::from_slice(&list_counts, vec![list_counts.len()], client)?,
+        max_walked,
+        counts_cells: n_cells,
+        use_table,
         totals,
         n_expressed,
         first,
@@ -204,14 +315,15 @@ fn stage_batch<R: Runtime>(
 
 /// How many planes share one gene in the first pass.
 ///
-/// Enough that each lane walks about [`CELLS_PER_LANE`] cells, rounded up to a
-/// power of two, and no more than the device or the kernel's shared scratch
-/// allows. Sized for the widest plane the device reports; a driver that picks
-/// a narrower one gives each gene more planes, which the cap accounts for.
+/// Enough that each lane walks about [`CELLS_PER_LANE`] listed cells, rounded
+/// up to a power of two, and no more than the device or the kernel's shared
+/// scratch allows. Sized for the widest plane the device reports; a driver that
+/// picks a narrower one gives each gene more planes, which the cap accounts
+/// for.
 ///
 /// ### Params
 ///
-/// * `n_cells` - Cells.
+/// * `n_cells` - Most cells any gene of the batch walks.
 /// * `limits` - The device's limits.
 ///
 /// ### Returns
@@ -254,7 +366,8 @@ fn planes_per_gene(n_cells: usize, limits: &GpuLimits) -> Result<u32, SanityErro
 ///
 /// * `batch` - The resident batch.
 /// * `log_totals` - `ln T_c` on the device.
-/// * `n_cells` - Cells.
+/// * `table` - The run's empty-cell table, if it has one.
+/// * `table_dev` - The same table on the device.
 /// * `log_total_sum` - `ln(sum_c T_c)`, which fixes the offset anchors.
 /// * `bin_v` - `v` per gene and bin, `[gene * n_bins + b]`.
 /// * `guess` - First bin's offset guess per gene.
@@ -269,7 +382,8 @@ fn planes_per_gene(n_cells: usize, limits: &GpuLimits) -> Result<u32, SanityErro
 fn run_sweep<R: Runtime>(
     batch: &Batch<R>,
     log_totals: &GpuTensor<R, f32>,
-    n_cells: usize,
+    table: Option<&ShiftTable>,
+    table_dev: &DeviceTable<R>,
     log_total_sum: f64,
     bin_v: &[f64],
     guess: &[f64],
@@ -280,7 +394,7 @@ fn run_sweep<R: Runtime>(
     let n_bins = bin_v.len() / n_genes;
     let limits = GpuLimits::from_client(client);
 
-    let cube_width = planes_per_gene(n_cells, &limits)? * limits.plane_size_max;
+    let cube_width = planes_per_gene(batch.max_walked, &limits)? * limits.plane_size_max;
 
     let anchor: Vec<f64> = bin_v
         .iter()
@@ -291,6 +405,7 @@ fn run_sweep<R: Runtime>(
         .iter()
         .map(|&k| k as f32)
         .chain((0..n_genes).map(|g| (guess[g] - anchor[g * n_bins]) as f32))
+        .chain(batch.use_table.iter().map(|&t| if t { 1.0 } else { 0.0 }))
         .collect();
     let mut bins: Vec<f32> = bin_v.iter().map(|&v| v as f32).collect();
     bins.extend(
@@ -308,7 +423,8 @@ fn run_sweep<R: Runtime>(
         }
     }));
 
-    let scalars = GpuTensor::<R, f32>::from_slice(&scalars, vec![2 * n_genes], client)?;
+    let log_vs = bins[n_genes * n_bins..2 * n_genes * n_bins].to_vec();
+    let scalars = GpuTensor::<R, f32>::from_slice(&scalars, vec![3 * n_genes], client)?;
     let bins = GpuTensor::<R, f32>::from_slice(&bins, vec![3 * n_genes * n_bins], client)?;
     let out = GpuTensor::<R, f32>::empty(vec![6 * n_genes * n_bins], client)?;
     let status = GpuTensor::<R, u32>::empty(vec![n_genes], client)?;
@@ -321,13 +437,21 @@ fn run_sweep<R: Runtime>(
             count,
             CubeDim::new_1d(cube_width),
             batch.counts.into_tensor_arg(),
+            batch.list_offsets.into_tensor_arg(),
+            batch.list_cells.into_tensor_arg(),
+            batch.list_counts.into_tensor_arg(),
             log_totals.into_tensor_arg(),
             scalars.into_tensor_arg(),
+            table_dev.breaks.into_tensor_arg(),
+            table_dev.anchors.into_tensor_arg(),
+            table_dev.coeffs.into_tensor_arg(),
+            table_dev.scalars.into_tensor_arg(),
+            table_dev.n_panels,
             bins.into_tensor_arg(),
             out.into_tensor_arg(),
             status.into_tensor_arg(),
             n_genes as u32,
-            n_cells as u32,
+            batch.counts_cells as u32,
             n_bins as u32,
             u32::from(cold_start),
         );
@@ -340,11 +464,12 @@ fn run_sweep<R: Runtime>(
             bin: code as usize - 1,
         });
     }
-    let host = out.clone().read(client)?;
+    let raw = out.clone().read(client)?;
+    let host = finish_sweep(&raw, &log_vs, &batch.use_table, table);
     let offsets = anchor
         .iter()
         .zip(&host)
-        .map(|(&a, &zeta)| a + zeta as f64)
+        .map(|(&a, &zeta)| a + zeta)
         .collect();
     Ok(SweepResult {
         device: out,
@@ -353,6 +478,55 @@ fn run_sweep<R: Runtime>(
         host,
         offsets,
     })
+}
+
+/// Widen the first pass's output to `f64` and add the empty cells' share.
+///
+/// A table gene's totals come back without it; it is added here from the `f64`
+/// table at the `f32` shift the device stopped at, the subtraction it
+/// performed itself. The device's `f32` table only steers its solve, and the
+/// likelihood's off-root term, `sum_c d_c / v` times order `s`, would carry
+/// that table's rounding.
+///
+/// A host Newton step on the offset from the completed residual was measured
+/// on 2026-09-30 and moved no offset by more than `5e-6`, table gene or not,
+/// so the device's offsets are used as they are.
+///
+/// ### Params
+///
+/// * `raw` - The device output.
+/// * `log_vs` - `ln(v s) - a_b` per gene and bin, as the device read it.
+/// * `use_table` - Per gene, whether it used the table.
+/// * `table` - The run's table, if it has one.
+///
+/// ### Returns
+///
+/// The output in `f64`, same layout.
+fn finish_sweep(
+    raw: &[f32],
+    log_vs: &[f32],
+    use_table: &[bool],
+    table: Option<&ShiftTable>,
+) -> Vec<f64> {
+    let stride = log_vs.len();
+    let n_bins = stride / use_table.len();
+    let mut host: Vec<f64> = raw.iter().map(|&x| x as f64).collect();
+    let empties: Vec<EmptySums> = (0..stride)
+        .into_par_iter()
+        .map(|i| match table {
+            Some(table) if use_table[i / n_bins] => {
+                let shift = (log_vs[i] - raw[i]) as f64;
+                table.eval(shift)
+            }
+            _ => EmptySums::default(),
+        })
+        .collect();
+    for (i, empty) in empties.into_iter().enumerate() {
+        host[2 * stride + i] += empty.omega_sq;
+        host[4 * stride + i] += empty.log_diag;
+        host[5 * stride + i] -= empty.omega;
+    }
+    host
 }
 
 /// Run the second pass over a batch.
@@ -491,11 +665,11 @@ fn bin_likelihoods<R: Runtime>(
                     batch.totals[g],
                     n_cells as f64,
                     batch.n_expressed[g] as f64,
-                    h[stride + i] as f64,
-                    h[2 * stride + i] as f64,
-                    h[3 * stride + i] as f64,
-                    h[4 * stride + i] as f64,
-                    h[5 * stride + i] as f64,
+                    h[stride + i],
+                    h[2 * stride + i],
+                    h[3 * stride + i],
+                    h[4 * stride + i],
+                    h[5 * stride + i],
                 );
             }
             (log_lik, offsets)
@@ -521,6 +695,8 @@ fn bin_likelihoods<R: Runtime>(
 /// * `s` - `K`.
 /// * `log_lik` - The device's log likelihood per bin.
 /// * `offsets` - The device's offset per bin, used as warm starts.
+/// * `table` - The run's empty-cell table; a gene at most
+///   [`SPARSE_MAX_DENSITY`] dense re-solves sparse against it, as on the CPU.
 ///
 /// ### Returns
 ///
@@ -534,6 +710,7 @@ fn resolve_max_posterior(
     s: f64,
     log_lik: &[f64],
     offsets: &[f64],
+    table: Option<&ShiftTable>,
 ) -> Result<(usize, f64), SanityErrors> {
     let peak = log_lik.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let candidates: Vec<usize> = (0..grid.len())
@@ -544,15 +721,30 @@ fn resolve_max_posterior(
     }
 
     let n_cells = log_totals.len();
-    let mut dense = vec![0.0; n_cells];
     let (indices, values) = counts.gene(gene);
+    let mut best = (candidates[0], f64::NEG_INFINITY, offsets[candidates[0]]);
+    if let Some(table) =
+        table.filter(|_| indices.len() as f64 <= SPARSE_MAX_DENSITY * n_cells as f64)
+    {
+        let mut cells = NonzeroCells::new(indices.len());
+        cells.load(indices, values, log_totals);
+        for b in candidates {
+            let (l, z) =
+                log_marginal_at_sparse(grid[b], s, offsets[b], table, log_totals, &mut cells)?;
+            if l > best.1 {
+                best = (b, l, z);
+            }
+        }
+        return Ok((best.0, best.2));
+    }
+
+    let mut dense = vec![0.0; n_cells];
     for (&i, &k) in indices.iter().zip(values) {
         dense[i as usize] = k as f64;
     }
     let mut omega = vec![0.0; n_cells];
     let mut log_omega = vec![0.0; n_cells];
     let mut state = None;
-    let mut best = (candidates[0], f64::NEG_INFINITY, offsets[candidates[0]]);
     // `candidates` ascends in `v`, so each solve warm starts from the last.
     for b in candidates {
         let (l, z) = log_marginal_at(
@@ -694,6 +886,8 @@ where
     }
     let start = Instant::now();
 
+    let table = shift_table(counts, &log_totals, &params);
+    let table_dev = DeviceTable::<R>::new(table.as_ref(), client)?;
     let log_totals_f32: Vec<f32> = log_totals.iter().map(|&x| x as f32).collect();
     let log_totals_dev = GpuTensor::<R, f32>::from_slice(&log_totals_f32, vec![n_cells], client)?;
 
@@ -721,7 +915,7 @@ where
         };
 
         let n = batch_genes.min(n_genes - first);
-        let batch = stage_batch(counts, first, n, client)?;
+        let batch = stage_batch(counts, first, n, table.is_some(), client)?;
         let ks = &batch.totals;
         lap("stage");
 
@@ -731,7 +925,8 @@ where
                 let sweep = run_sweep(
                     &batch,
                     &log_totals_dev,
-                    n_cells,
+                    table.as_ref(),
+                    &table_dev,
                     log_total_sum,
                     &vec![v; n],
                     &guess,
@@ -750,7 +945,8 @@ where
                 let sweep = run_sweep(
                     &batch,
                     &log_totals_dev,
-                    n_cells,
+                    table.as_ref(),
+                    &table_dev,
                     log_total_sum,
                     &bin_v,
                     &guess,
@@ -812,6 +1008,7 @@ where
                                 ks[g],
                                 log_lik,
                                 z,
+                                table.as_ref(),
                             )?;
                             Ok((grid.values[b], z, target.2))
                         })
@@ -823,7 +1020,8 @@ where
                     let point = run_sweep(
                         &batch,
                         &log_totals_dev,
-                        n_cells,
+                        table.as_ref(),
+                        &table_dev,
                         log_total_sum,
                         &bin_v,
                         &guess,
@@ -1007,12 +1205,14 @@ mod tests {
     ///
     /// The error that matters for the argmax: how far the device moves one
     /// bin's log likelihood relative to the CPU's best bin, over the bins close
-    /// enough to the peak to compete for it.
-    fn worst_gap_error(n_genes: usize, n_cells: usize) -> f64 {
+    /// enough to the peak to compete for it. A library size of 500 over 100
+    /// genes puts nearly every gene past the density gate, so only 25 reaches
+    /// the table path.
+    fn worst_gap_error(n_genes: usize, n_cells: usize, library_size: f64) -> f64 {
         let sim = simulate(Some(SimulationParams {
             n_genes,
             n_cells,
-            library_size: 500.0,
+            library_size,
             seed: 5,
             ..Default::default()
         }))
@@ -1026,13 +1226,16 @@ mod tests {
         let log_totals_dev =
             GpuTensor::<WgpuRuntime, f32>::from_slice(&log_totals_f32, vec![n_cells], &client)
                 .expect("uploads");
-        let batch = stage_batch(&sim.counts, 0, n, &client).expect("stages");
+        let table = shift_table(&sim.counts, &log_totals, &params);
+        let table_dev = DeviceTable::new(table.as_ref(), &client).expect("uploads");
+        let batch = stage_batch(&sim.counts, 0, n, table.is_some(), &client).expect("stages");
         let bin_v: Vec<f64> = (0..n).flat_map(|_| grid.values.iter().copied()).collect();
         let guess = vec![log_total_sum + 0.5 * grid.values[0]; n];
         let sweep = run_sweep(
             &batch,
             &log_totals_dev,
-            n_cells,
+            table.as_ref(),
+            &table_dev,
             log_total_sum,
             &bin_v,
             &guess,
@@ -1083,29 +1286,33 @@ mod tests {
             })
             .reduce(|| 0.0, f64::max);
         println!(
-            "{n_genes} genes x {n_cells} cells: worst device error in a log likelihood gap {worst:e}"
+            "{n_genes} genes x {n_cells} cells, library {library_size}: worst device error in a log likelihood gap {worst:e}"
         );
         worst
     }
 
     #[test]
     fn test_gpu_bin_likelihood_error_is_inside_the_tie_margin() {
-        let worst = worst_gap_error(100, 20_000);
         let margin = tie_margin(20_000);
-        assert!(
-            worst <= 0.5 * margin,
-            "device error {worst:e} is not safely inside the tie margin {margin:e}"
-        );
+        for library_size in [500.0, 25.0] {
+            let worst = worst_gap_error(100, 20_000, library_size);
+            assert!(
+                worst <= 0.5 * margin,
+                "library {library_size}: device error {worst:e} is not safely inside the tie margin {margin:e}"
+            );
+        }
     }
 
     #[test]
     #[ignore = "a 200k cell CPU reference; run with --ignored"]
     fn test_gpu_bin_likelihood_error_is_inside_the_tie_margin_at_scale() {
-        let worst = worst_gap_error(50, 200_000);
         let margin = tie_margin(200_000);
-        assert!(
-            worst <= 0.5 * margin,
-            "device error {worst:e} is not safely inside the tie margin {margin:e}"
-        );
+        for library_size in [500.0, 25.0] {
+            let worst = worst_gap_error(50, 200_000, library_size);
+            assert!(
+                worst <= 0.5 * margin,
+                "library {library_size}: device error {worst:e} is not safely inside the tie margin {margin:e}"
+            );
+        }
     }
 }
