@@ -9,6 +9,14 @@
 //! known offset with a single sweep and no iteration. Scratch is `O(B + C)`.
 //! The point-estimate rules skip the second pass entirely.
 //!
+//! ### Empty cells
+//!
+//! Neither pass evaluates the cells with no counts one by one. The first pass
+//! reads their sums from [`ShiftTable`]; the second pass, and the point
+//! estimates, evaluate them at the nodes of one Chebyshev fit in `ln T` and
+//! interpolate, since an empty cell's outputs depend on it only through its
+//! total. What is swept per bin is the gene's nonzero cells plus the nodes.
+//!
 //! Running the second pass cell block outermost instead, so that a block stays
 //! in L1 across the whole grid, was measured on 2026-09-13 and was 10% slower:
 //! the pass is bound by the transcendentals in the Wright omega and error bar
@@ -23,6 +31,7 @@ use super::likelihood::{laplace, laplace_sparse};
 use super::variance::cell_variance;
 use crate::config::{SanityParams, VarianceGrid, VarianceRule};
 use crate::errors::SanityErrors;
+use crate::utils::chebyshev::Chebyshev;
 use crate::utils::polygamma::{digamma, trigamma};
 
 ////////////
@@ -63,6 +72,27 @@ pub(crate) const MARGINALISE_MIN_WEIGHT: f64 = 1e-10;
 /// with no gate. At 59.8%: 2.45 s, 2.41 s, 2.40 s, 2.46 s, 2.57 s and 3.36 s.
 const SPARSE_MAX_DENSITY: f64 = 0.5;
 
+/// Chebyshev degree of the fit that fills in the empty cells.
+///
+/// An empty cell's outputs depend on the cell only through `ln T_c`, so the
+/// second pass evaluates them at the nodes of one fit over the run's range of
+/// `ln T` and interpolates to every empty cell.
+///
+/// Measured 2026-09-30 on an M1 Max, `Marginalise`, 400 simulated genes over
+/// 4000 cells, worst log fold change against the per-cell pass in units of its
+/// error bar. Library log sd 0.5: `1.7e-6` at degree 16, `3.5e-9` at 24,
+/// `1.1e-11` at 32 and 48. Log sd 1.5, a spread well past droplet data:
+/// `2.1e-5`, `1.2e-7`, `9.1e-10`, `5.9e-12`. Wall clock did not move with the
+/// degree (0.49 to 0.53 s at sd 0.5), so this takes the degree that stays at
+/// the per-cell pass's own noise across both.
+const EMPTY_FIT_DEGREE: usize = 48;
+
+/// Smallest width of the fit's interval in `ln T`.
+///
+/// Stops a run whose cells all have one total from giving a zero-width
+/// interval; the nodes then simply extend past the data.
+const EMPTY_FIT_MIN_WIDTH: f64 = 1.0;
+
 /////////////////
 // GeneScratch //
 /////////////////
@@ -94,7 +124,16 @@ pub(crate) struct GeneScratch {
     weights: Vec<f64>,
     /// The gene's nonzero cells, for the sparse first pass.
     nonzero: NonzeroCells,
-    /// What `omega` and `log_omega` currently hold, for warm starting.
+    /// Counts of the cells the second pass evaluates, see [`load_cells`].
+    cell_counts: Vec<f64>,
+    /// `ln T` of the cells the second pass evaluates.
+    cell_log_totals: Vec<f64>,
+    /// Node values of the empty-cell fit, `d` then `e`.
+    fit_values: Vec<f64>,
+    /// Chebyshev coefficients of the empty-cell fit, `d` then `e`.
+    fit_coeffs: Vec<f64>,
+    /// What `omega` and `log_omega` currently hold, for warm starting. In the
+    /// second pass they hold the compact cells of [`load_cells`] instead.
     ///
     /// Cleared at the start of every gene: the arrays survive across genes but
     /// their contents belong to the gene that wrote them.
@@ -125,6 +164,10 @@ impl GeneScratch {
             curvature: vec![0.0; n_bins],
             weights: vec![0.0; n_bins],
             nonzero: NonzeroCells::new(n_cells),
+            cell_counts: Vec::with_capacity(n_cells),
+            cell_log_totals: Vec::with_capacity(n_cells),
+            fit_values: Vec::new(),
+            fit_coeffs: Vec::new(),
             state: None,
         }
     }
@@ -250,39 +293,40 @@ pub(crate) fn posterior_weights(log_lik: &[f64], weights: &mut [f64]) -> Result<
 /// SI eq. 39 and 42. `z_b` is already known, so each bin costs one sweep with no
 /// iteration. The spread of `d*_c` across bins accumulates by weighted Welford,
 /// which is SI eq. 42 rather than the algebraically equivalent SI eq. 41 and so
-/// does not lose digits when the log fold change is large.
+/// does not lose digits when the log fold change is large. Only the cells of
+/// [`load_cells`] are swept.
 ///
 /// ### Params
 ///
 /// * `s` - `K`, the total UMI count of this gene.
+/// * `indices` - Cell indices of this gene's stored counts.
 /// * `log_totals` - `ln T_c` for every cell.
 /// * `grid` - The variance grid.
+/// * `fit` - The run's empty-cell fit.
 /// * `scratch` - Per-thread scratch.
 /// * `out_fold_change` - Output, `d_c` for every cell.
 /// * `out_error` - Output, `e_c` for every cell.
-/// * `n_cells` - Number of cells.
 ///
 /// ### Returns
 ///
 /// The gene-level summary.
+#[allow(clippy::too_many_arguments)]
 fn marginalise(
     s: f64,
+    indices: &[u32],
     log_totals: &[f64],
     grid: &VarianceGrid,
+    fit: &Chebyshev,
     scratch: &mut GeneScratch,
     out_fold_change: &mut [f64],
     out_error: &mut [f64],
-    n_cells: usize,
 ) -> GeneSummary {
     // The gene-level scalars do not touch the cells, so they come out of the
-    // tiled loop entirely and are accumulated once over the grid.
+    // cell loop entirely and are accumulated once over the grid.
     let (summary, weight_sum) =
         marginal_summary(s, &grid.values, &scratch.weights, &scratch.offsets);
 
-    scratch.mean_d[..n_cells].fill(0.0);
-    scratch.m2_d[..n_cells].fill(0.0);
-    scratch.mean_var[..n_cells].fill(0.0);
-
+    let interpolate = load_cells(indices, log_totals, fit, scratch);
     let mut running = 0.0;
     for (b, &v) in grid.values.iter().enumerate() {
         let weight = scratch.weights[b];
@@ -296,36 +340,179 @@ fn marginalise(
             z: scratch.offsets[b],
             curvature_sum: scratch.curvature[b],
         };
-        refresh(
-            &point,
-            &scratch.counts,
-            log_totals,
-            &mut scratch.state,
-            &mut scratch.omega,
-            &mut scratch.log_omega,
-        );
-
         running += weight;
-        let share = weight / running;
-
-        #[allow(clippy::needless_range_loop)]
-        for c in 0..n_cells {
-            let d = point.log_fold_change(scratch.log_omega[c], log_totals[c]);
-            let var = cell_variance(&point, scratch.counts[c], d, scratch.omega[c]);
-
-            let delta = d - scratch.mean_d[c];
-            scratch.mean_d[c] += share * delta;
-            scratch.m2_d[c] += weight * delta * (d - scratch.mean_d[c]);
-            scratch.mean_var[c] += share * (var - scratch.mean_var[c]);
-        }
+        accumulate_bin(&point, weight, running, scratch);
     }
-
-    for c in 0..n_cells {
-        out_fold_change[c] = scratch.mean_d[c];
-        out_error[c] = (scratch.mean_var[c] + scratch.m2_d[c] / weight_sum).sqrt();
-    }
+    write_cells(
+        indices,
+        log_totals,
+        fit,
+        interpolate,
+        weight_sum,
+        scratch,
+        out_fold_change,
+        out_error,
+    );
 
     summary
+}
+
+/// Load the cells the second pass evaluates into the compact arrays.
+///
+/// An empty cell's `d*_c` and `var(d_c)` depend on the cell only through
+/// `ln T_c`, at every bin. With more empty cells than `fit` has nodes, the
+/// compact arrays hold the gene's nonzero cells, in `indices` order, followed by
+/// one stand-in empty cell at each node. Otherwise they hold every cell in order
+/// and nothing is interpolated. Clears the Welford accumulators and the sweep
+/// state, since the arrays change meaning.
+///
+/// ### Params
+///
+/// * `indices` - Cell indices of this gene's stored counts.
+/// * `log_totals` - `ln T_c` for every cell.
+/// * `fit` - The run's empty-cell fit.
+/// * `scratch` - Per-thread scratch, with `counts` scattered.
+///
+/// ### Returns
+///
+/// Whether the empty cells are to be interpolated.
+fn load_cells(
+    indices: &[u32],
+    log_totals: &[f64],
+    fit: &Chebyshev,
+    scratch: &mut GeneScratch,
+) -> bool {
+    let n_cells = log_totals.len();
+    let n_nonzero = indices
+        .iter()
+        .filter(|&&i| scratch.counts[i as usize] > 0.0)
+        .count();
+    let interpolate = n_cells - n_nonzero > fit.n_points();
+
+    scratch.cell_counts.clear();
+    scratch.cell_log_totals.clear();
+    if interpolate {
+        for &i in indices {
+            let k = scratch.counts[i as usize];
+            if k > 0.0 {
+                scratch.cell_counts.push(k);
+                scratch.cell_log_totals.push(log_totals[i as usize]);
+            }
+        }
+        for j in 0..fit.n_points() {
+            scratch.cell_counts.push(0.0);
+            scratch.cell_log_totals.push(fit.node(j));
+        }
+    } else {
+        scratch
+            .cell_counts
+            .extend_from_slice(&scratch.counts[..n_cells]);
+        scratch.cell_log_totals.extend_from_slice(log_totals);
+    }
+
+    let n = scratch.cell_counts.len();
+    scratch.mean_d[..n].fill(0.0);
+    scratch.m2_d[..n].fill(0.0);
+    scratch.mean_var[..n].fill(0.0);
+    scratch.state = None;
+    interpolate
+}
+
+/// Add one bin to the Welford accumulators of the compact cells.
+///
+/// ### Params
+///
+/// * `point` - The stationary point of this bin.
+/// * `weight` - The bin's posterior weight.
+/// * `running` - Total weight so far, this bin included.
+/// * `scratch` - Per-thread scratch, loaded by [`load_cells`].
+fn accumulate_bin(point: &Stationary, weight: f64, running: f64, scratch: &mut GeneScratch) {
+    let n = scratch.cell_counts.len();
+    refresh(
+        point,
+        &scratch.cell_counts,
+        &scratch.cell_log_totals,
+        &mut scratch.state,
+        &mut scratch.omega[..n],
+        &mut scratch.log_omega[..n],
+    );
+
+    let share = weight / running;
+    for c in 0..n {
+        let d = point.log_fold_change(scratch.log_omega[c], scratch.cell_log_totals[c]);
+        let var = cell_variance(point, scratch.cell_counts[c], d, scratch.omega[c]);
+
+        let delta = d - scratch.mean_d[c];
+        scratch.mean_d[c] += share * delta;
+        scratch.m2_d[c] += weight * delta * (d - scratch.mean_d[c]);
+        scratch.mean_var[c] += share * (var - scratch.mean_var[c]);
+    }
+}
+
+/// Write `d_c` and `e_c` for every cell from the compact accumulators.
+///
+/// Nonzero cells are written from their own accumulators; empty cells, when
+/// interpolated, from the fit through the node values.
+///
+/// ### Params
+///
+/// * `indices` - Cell indices of this gene's stored counts.
+/// * `log_totals` - `ln T_c` for every cell.
+/// * `fit` - The run's empty-cell fit.
+/// * `interpolate` - What [`load_cells`] returned.
+/// * `weight_sum` - Total weight of the accumulated bins.
+/// * `scratch` - Per-thread scratch.
+/// * `out_fold_change` - Output, `d_c` for every cell.
+/// * `out_error` - Output, `e_c` for every cell.
+#[allow(clippy::too_many_arguments)]
+fn write_cells(
+    indices: &[u32],
+    log_totals: &[f64],
+    fit: &Chebyshev,
+    interpolate: bool,
+    weight_sum: f64,
+    scratch: &mut GeneScratch,
+    out_fold_change: &mut [f64],
+    out_error: &mut [f64],
+) {
+    let error = |scratch: &GeneScratch, c: usize| {
+        (scratch.mean_var[c] + scratch.m2_d[c] / weight_sum).sqrt()
+    };
+
+    if !interpolate {
+        for c in 0..log_totals.len() {
+            out_fold_change[c] = scratch.mean_d[c];
+            out_error[c] = error(scratch, c);
+        }
+        return;
+    }
+
+    let p = fit.n_points();
+    let first_node = scratch.cell_counts.len() - p;
+    scratch.fit_values.resize(2 * p, 0.0);
+    scratch.fit_coeffs.resize(2 * p, 0.0);
+    for j in 0..p {
+        scratch.fit_values[j] = scratch.mean_d[first_node + j];
+        scratch.fit_values[p + j] = error(scratch, first_node + j);
+    }
+    let (values_d, values_e) = scratch.fit_values.split_at(p);
+    let (coeffs_d, coeffs_e) = scratch.fit_coeffs.split_at_mut(p);
+    fit.coefficients(values_d, coeffs_d);
+    fit.coefficients(values_e, coeffs_e);
+
+    for (c, &lt) in log_totals.iter().enumerate() {
+        out_fold_change[c] = fit.eval(coeffs_d, lt);
+        out_error[c] = fit.eval(coeffs_e, lt);
+    }
+    let mut m = 0;
+    for &i in indices {
+        let i = i as usize;
+        if scratch.counts[i] > 0.0 {
+            out_fold_change[i] = scratch.mean_d[m];
+            out_error[i] = error(scratch, m);
+            m += 1;
+        }
+    }
 }
 
 /// The gene-level summary of the marginalising rule, from the per-bin offsets.
@@ -426,16 +613,20 @@ pub(crate) fn collapse_target(
 
 /// Collapse the variance posterior to a single value and evaluate there.
 ///
-/// SPEC section 7. [`VarianceRule::MaxPosterior`] reuses the offset already
-/// stored for that bin; [`VarianceRule::PosteriorMean`] lands between bins and
-/// so re-solves, warm started from the offset of the bin nearest `<v>`.
+/// SPEC section 7. [`VarianceRule::MaxPosterior`] reuses the offset stored for
+/// that bin as its guess; [`VarianceRule::PosteriorMean`] lands between bins,
+/// warm started from the offset of the bin nearest `<v>`. Either re-solves,
+/// sparse when the first pass was.
 ///
 /// ### Params
 ///
 /// * `rule` - The collapsing rule.
 /// * `s` - `K`, the total UMI count of this gene.
+/// * `indices` - Cell indices of this gene's stored counts.
 /// * `log_totals` - `ln T_c` for every cell.
 /// * `grid` - The variance grid.
+/// * `table` - The empty-cell sums, if the first pass was sparse.
+/// * `fit` - The run's empty-cell fit.
 /// * `scratch` - Per-thread scratch.
 /// * `out_fold_change` - Output, `d_c` for every cell.
 /// * `out_error` - Output, `e_c` for every cell.
@@ -443,11 +634,15 @@ pub(crate) fn collapse_target(
 /// ### Returns
 ///
 /// The gene-level summary, or a solver failure.
+#[allow(clippy::too_many_arguments)]
 fn collapse(
     rule: VarianceRule,
     s: f64,
+    indices: &[u32],
     log_totals: &[f64],
     grid: &VarianceGrid,
+    table: Option<&ShiftTable>,
+    fit: &Chebyshev,
     scratch: &mut GeneScratch,
     out_fold_change: &mut [f64],
     out_error: &mut [f64],
@@ -455,22 +650,38 @@ fn collapse(
     let (v, guess, posterior_mean) =
         collapse_target(rule, &grid.values, &scratch.weights, &scratch.offsets);
 
-    let point = solve_stationary(
-        v,
-        s,
-        &scratch.counts,
-        log_totals,
-        guess,
-        &mut scratch.state,
-        &mut scratch.omega,
-        &mut scratch.log_omega,
-    )?;
-    write_point_estimate(
+    let point = match table {
+        Some(table) => {
+            // Cold per-cell state: the last sweep sat at the top of the grid,
+            // too far from `v` for the warm start's prediction.
+            scratch.nonzero.state = None;
+            solve_stationary_sparse(
+                v,
+                s,
+                log_totals.len(),
+                guess,
+                table,
+                log_totals,
+                &mut scratch.nonzero,
+            )?
+        }
+        None => solve_stationary(
+            v,
+            s,
+            &scratch.counts,
+            log_totals,
+            guess,
+            &mut scratch.state,
+            &mut scratch.omega,
+            &mut scratch.log_omega,
+        )?,
+    };
+    point_estimate(
         &point,
-        &scratch.counts,
+        indices,
         log_totals,
-        &scratch.omega,
-        &scratch.log_omega,
+        fit,
+        scratch,
         out_fold_change,
         out_error,
     );
@@ -486,36 +697,55 @@ fn collapse(
 ///
 /// Used by every rule that does not integrate over the grid, where the error bar
 /// is the posterior width at one variance and nothing is added for the spread of
-/// `d*_c` across variances.
+/// `d*_c` across variances. One bin of weight one through the second pass's
+/// machinery, so the empty cells are interpolated the same way.
 ///
 /// ### Params
 ///
 /// * `point` - The stationary point.
-/// * `counts` - Dense UMI counts for this gene.
+/// * `indices` - Cell indices of this gene's stored counts.
 /// * `log_totals` - `ln T_c` for every cell.
-/// * `omega` - `omega(x_c)` at the point.
-/// * `log_omega` - `ln omega(x_c)` at the point.
+/// * `fit` - The run's empty-cell fit.
+/// * `scratch` - Per-thread scratch.
 /// * `out_fold_change` - Output, `d_c` for every cell.
 /// * `out_error` - Output, `e_c` for every cell.
-///
-/// ### Returns
-///
-/// Nothing; both outputs are overwritten.
-#[allow(clippy::too_many_arguments)]
-fn write_point_estimate(
+fn point_estimate(
     point: &Stationary,
-    counts: &[f64],
+    indices: &[u32],
     log_totals: &[f64],
-    omega: &[f64],
-    log_omega: &[f64],
+    fit: &Chebyshev,
+    scratch: &mut GeneScratch,
     out_fold_change: &mut [f64],
     out_error: &mut [f64],
 ) {
-    for c in 0..counts.len() {
-        let d = point.log_fold_change(log_omega[c], log_totals[c]);
-        out_fold_change[c] = d;
-        out_error[c] = cell_variance(point, counts[c], d, omega[c]).sqrt();
-    }
+    let interpolate = load_cells(indices, log_totals, fit, scratch);
+    accumulate_bin(point, 1.0, 1.0, scratch);
+    write_cells(
+        indices,
+        log_totals,
+        fit,
+        interpolate,
+        1.0,
+        scratch,
+        out_fold_change,
+        out_error,
+    );
+}
+
+/// The run's fit for the empty cells, over the range of `ln T`.
+///
+/// ### Params
+///
+/// * `log_totals` - `ln T_c` for every cell.
+///
+/// ### Returns
+///
+/// Degree [`EMPTY_FIT_DEGREE`] interpolation over the cells' `ln T`, at least
+/// [`EMPTY_FIT_MIN_WIDTH`] wide.
+pub(crate) fn empty_cell_fit(log_totals: &[f64]) -> Chebyshev {
+    let lo = log_totals.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = log_totals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    Chebyshev::new(lo, hi.max(lo + EMPTY_FIT_MIN_WIDTH), EMPTY_FIT_DEGREE)
 }
 
 /// The log marginal likelihood of one gene at one variance, in `f64`.
@@ -585,6 +815,7 @@ pub(crate) struct GeneSummary {
 /// * `grid` - The variance grid.
 /// * `table` - The run's empty-cell sums, if built. Used for the first pass
 ///   when the gene is at most [`SPARSE_MAX_DENSITY`] dense.
+/// * `fit` - The run's empty-cell fit, from [`empty_cell_fit`].
 /// * `params` - Run parameters.
 /// * `scratch` - Per-thread scratch.
 /// * `out_fold_change` - Output, `d_c` for every cell.
@@ -601,6 +832,7 @@ pub(crate) fn run_gene(
     log_total_sum: f64,
     grid: &VarianceGrid,
     table: Option<&ShiftTable>,
+    fit: &Chebyshev,
     params: &SanityParams,
     scratch: &mut GeneScratch,
     out_fold_change: &mut [f64],
@@ -632,12 +864,12 @@ pub(crate) fn run_gene(
                 &mut scratch.omega,
                 &mut scratch.log_omega,
             )?;
-            write_point_estimate(
+            point_estimate(
                 &point,
-                &scratch.counts,
+                indices,
                 log_totals,
-                &scratch.omega,
-                &scratch.log_omega,
+                fit,
+                scratch,
                 out_fold_change,
                 out_error,
             );
@@ -658,18 +890,22 @@ pub(crate) fn run_gene(
             match rule {
                 VarianceRule::Marginalise => marginalise(
                     s,
+                    indices,
                     log_totals,
                     grid,
+                    fit,
                     scratch,
                     out_fold_change,
                     out_error,
-                    n_cells,
                 ),
                 _ => collapse(
                     rule,
                     s,
+                    indices,
                     log_totals,
                     grid,
+                    table,
+                    fit,
                     scratch,
                     out_fold_change,
                     out_error,
@@ -683,4 +919,81 @@ pub(crate) fn run_gene(
     }
 
     Ok(summary)
+}
+
+///////////
+// Tests //
+///////////
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Verbosity;
+    use crate::simulate::{SimulationParams, simulate};
+
+    #[test]
+    fn test_empty_cell_fit_matches_per_cell_pass() {
+        let sim = simulate(Some(SimulationParams {
+            n_genes: 30,
+            n_cells: 400,
+            library_size: 100.0,
+            library_log_sd: 1.0,
+            ..SimulationParams::default()
+        }))
+        .expect("valid simulation");
+        let n_cells = sim.cell_totals.len();
+        let log_totals: Vec<f64> = sim.cell_totals.iter().map(|t| t.ln()).collect();
+        let log_total_sum = sim.cell_totals.iter().sum::<f64>().ln();
+        let grid = VarianceGrid::new(1e-3, 50.0, 60);
+        let table = ShiftTable::new(&log_totals, 50.0 * 1e5);
+
+        let fit = empty_cell_fit(&log_totals);
+        // More nodes than cells, so `load_cells` sweeps every cell directly.
+        let exact = Chebyshev::new(0.0, 1.0, n_cells);
+
+        for rule in [
+            VarianceRule::Marginalise,
+            VarianceRule::PosteriorMean,
+            VarianceRule::Fixed(1.0),
+        ] {
+            let params = SanityParams::new(rule, 1e-3, 50.0, 60, Verbosity::Quiet);
+            let mut scratch = GeneScratch::new(n_cells, grid.len());
+            let (mut d_fit, mut e_fit) = (vec![0.0; n_cells], vec![0.0; n_cells]);
+            let (mut d_all, mut e_all) = (vec![0.0; n_cells], vec![0.0; n_cells]);
+            for g in 0..sim.counts.n_genes() {
+                let (indices, values) = sim.counts.gene(g);
+                if values.is_empty() {
+                    continue;
+                }
+                for (f, d, e) in [
+                    (&fit, &mut d_fit, &mut e_fit),
+                    (&exact, &mut d_all, &mut e_all),
+                ] {
+                    run_gene(
+                        indices,
+                        values,
+                        &log_totals,
+                        log_total_sum,
+                        &grid,
+                        Some(&table),
+                        f,
+                        &params,
+                        &mut scratch,
+                        d,
+                        e,
+                    )
+                    .expect("converges");
+                }
+                for c in 0..n_cells {
+                    let err = (d_fit[c] - d_all[c]).abs() / e_all[c];
+                    assert!(err < 1e-9, "{rule:?} gene {g} cell {c}: {err:e} error bars");
+                    let err = (e_fit[c] - e_all[c]).abs() / e_all[c];
+                    assert!(
+                        err < 1e-9,
+                        "{rule:?} gene {g} cell {c}: error bar off by {err:e}"
+                    );
+                }
+            }
+        }
+    }
 }

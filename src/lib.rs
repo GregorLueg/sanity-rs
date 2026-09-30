@@ -48,7 +48,7 @@ use crate::errors::SanityErrors;
 use crate::float::{SanityFloat, narrow};
 use crate::input::CountMatrix;
 use crate::model::empty_cells::ShiftTable;
-use crate::model::gene::{GeneScratch, GeneSummary, run_gene};
+use crate::model::gene::{GeneScratch, GeneSummary, empty_cell_fit, run_gene};
 use crate::utils::progress::report_decile_progress;
 
 //////////////////
@@ -133,6 +133,7 @@ pub fn sanity<T: SanityFloat>(
     let n_genes = counts.n_genes();
     let (grid, log_totals, log_total_sum) = prepare_run(counts, cell_totals, &params)?;
     let table = shift_table(counts, &log_totals, &params);
+    let fit = empty_cell_fit(&log_totals);
 
     let verbose = params.verbosity.normal_verbosity();
     if verbose {
@@ -174,6 +175,7 @@ pub fn sanity<T: SanityFloat>(
                     log_total_sum,
                     &grid,
                     table.as_ref(),
+                    &fit,
                     &params,
                     scratch,
                     row_d,
@@ -396,6 +398,7 @@ where
     let n_genes = counts.n_genes();
     let (grid, log_totals, log_total_sum) = prepare_run(counts, cell_totals, &params)?;
     let table = shift_table(counts, &log_totals, &params);
+    let fit = empty_cell_fit(&log_totals);
 
     let verbose = params.verbosity.normal_verbosity();
     if verbose {
@@ -424,6 +427,7 @@ where
                     log_total_sum,
                     &grid,
                     table.as_ref(),
+                    &fit,
                     &params,
                     scratch,
                     row_d,

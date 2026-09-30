@@ -20,6 +20,7 @@
 
 use rayon::prelude::*;
 
+use crate::utils::chebyshev::{Chebyshev, clenshaw};
 use crate::utils::wright_omega::{log_omega, omega_from_log};
 
 ////////////
@@ -318,58 +319,22 @@ impl ShiftTable {
 ///
 /// The four midpoint anchors and the coefficients, `[f * PANEL_POINTS + k]`.
 fn fit_panel(log_totals: &[f64], a: f64, b: f64) -> ([f64; N_SUMS], Vec<f64>) {
-    let n = PANEL_DEGREE as f64;
+    let cheb = Chebyshev::new(a, b, PANEL_DEGREE);
     let nodes: Vec<[f64; N_SUMS]> = (0..PANEL_POINTS)
         .into_par_iter()
-        .map(|j| {
-            let t = (std::f64::consts::PI * j as f64 / n).cos();
-            direct_sums(log_totals, 0.5 * (a + b) + 0.5 * (b - a) * t).to_array()
-        })
+        .map(|j| direct_sums(log_totals, cheb.node(j)).to_array())
         .collect();
     let anchor = nodes[PANEL_DEGREE / 2];
 
     let mut coeffs = vec![0.0; N_SUMS * PANEL_POINTS];
-    for f in 0..N_SUMS {
-        let y: Vec<f64> = nodes.iter().map(|g| (g[f] / anchor[f]).ln()).collect();
-        for k in 0..PANEL_POINTS {
-            let mut c = 0.0;
-            for (j, &yj) in y.iter().enumerate() {
-                let half = if j == 0 || j == PANEL_DEGREE {
-                    0.5
-                } else {
-                    1.0
-                };
-                c += half * yj * (std::f64::consts::PI * (j * k) as f64 / n).cos();
-            }
-            c *= 2.0 / n;
-            if k == 0 || k == PANEL_DEGREE {
-                c *= 0.5;
-            }
-            coeffs[f * PANEL_POINTS + k] = c;
+    let mut y = [0.0; PANEL_POINTS];
+    for (f, c) in coeffs.chunks_exact_mut(PANEL_POINTS).enumerate() {
+        for (yj, g) in y.iter_mut().zip(&nodes) {
+            *yj = (g[f] / anchor[f]).ln();
         }
+        cheb.coefficients(&y, c);
     }
     (anchor, coeffs)
-}
-
-/// Evaluate a Chebyshev series by Clenshaw's recurrence.
-///
-/// ### Params
-///
-/// * `c` - Coefficients, `c[k]` multiplying `T_k`.
-/// * `t` - Point in `[-1, 1]`.
-///
-/// ### Returns
-///
-/// `sum_k c[k] T_k(t)`.
-#[inline(always)]
-fn clenshaw(c: &[f64], t: f64) -> f64 {
-    let (mut b1, mut b2) = (0.0, 0.0);
-    for &ck in c[1..].iter().rev() {
-        let b0 = 2.0 * t * b1 - b2 + ck;
-        b2 = b1;
-        b1 = b0;
-    }
-    t * b1 - b2 + c[0]
 }
 
 ///////////
